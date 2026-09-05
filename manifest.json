@@ -1,0 +1,94 @@
+{
+  "manifest_version": 3,
+  "name": "Evidencias SQA",
+  "version": "4.1.1",
+  "description": "Herramienta de captura y gestión de evidencias con soporte de edición y adjuntos.",
+  "icons": {
+    "16": "Media/SQA-16.png",
+    "32": "Media/SQA-32.png",
+    "48": "Media/SQA-48.png",
+    "128": "Media/SQA-128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "clipboardWrite",
+    "storage",
+    "unlimitedStorage"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "evidencias-sqa@sqa.com.co",
+      "strict_min_version": "121.0"
+    }
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Capturar Evidencias",
+    "default_icon": {
+      "16": "Media/SQA-16.png",
+      "32": "Media/SQA-32.png",
+      "48": "Media/SQA-48.png",
+      "128": "Media/SQA-128.png"
+    },
+    "default_popup": "popup.html"
+  },
+  "commands": {
+    "_execute_action": {
+      "description": "Ver visor"
+    },
+    "capture-all": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Capturar toda la página"
+    },
+    "capture-area": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+E",
+        "mac": "Command+Shift+E"
+      },
+      "description": "Seleccionar área"
+    },
+    "capture-visible": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+W",
+        "mac": "Command+Shift+X"
+      },
+      "description": "Capturar parte visible"
+    },
+    "open-viewer": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+V",
+        "mac": "Command+Shift+V"
+      },
+      "description": "Abrir visor de evidencias"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "Media/SQA-16.png",
+        "Media/SQA-32.png",
+        "Media/SQA-48.png",
+        "Media/SQA-128.png",
+        "Media/SQA1-16.png",
+        "Media/SQA1-32.png",
+        "Media/SQA1-48.png",
+        "Media/SQA1-128.png",
+        "lib/pdf.worker.min.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
