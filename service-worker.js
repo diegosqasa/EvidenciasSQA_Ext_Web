@@ -10,12 +10,18 @@ import { executeCapture, waitForCaptureQuota, setHealingCleanup } from './js/bac
 import { getAuthHeaders, invalidateToken } from './js/background/auth.js';
 import * as OfflineDB from './js/background/offline-db.js';
 
-const TEMP_IMAGE_STORAGE_TTL_MS = 60000;
+// CHUNK_TIMEOUT_MS: timeout de sesiones de chunks de los protocolos vivos
+// (pdfRenderBlobChunk, stitchBinaryChunk, buffers locales de PDF).
 const CHUNK_TIMEOUT_MS = 30000;
 const CAPTURE_IMAGE_FORMAT = 'png';
 const VIEWER_API_BASE_URL = 'http://127.0.0.1:3000';
 
 const pdfCaptureChunks = new Map();
+// PERF-03 (auditoría _002): sesiones del canal binario stitch → SW. Un Blob por
+// chrome.runtime sobrevive solo con el opt-in "message_serialization":
+// "structured_clone" (Chrome >= 148); ver stitchBinaryProbe en content.js.
+const stitchBinarySessions = new Map();
+const STITCH_CHUNK_TTL_MS = 60000;
 // BUG_PDF_FILE_001: ensamblaje de bytes de PDF local (file://) leídos por el
 // content script. Al completarse se reenvían al offscreen vía beginOffscreenPdfRender.
 const pdfLocalBuffers = new Map();
@@ -27,6 +33,9 @@ let sqaPdfWorkerTextCache = null;
 // BUG_PDF_001: tabs cuyo PDF degradó a captura visible (parcial). Se consume en _finalizeCapture
 // porque el markCaptureError previo queda sobrescrito por el éxito del fallback.
 const pdfPartialFallback = new Set();
+// BUG_PDF_STALL_002: reintento en página ya usado por tab (solo 1 vez, evita bucles
+// si el render en página también falla).
+const pdfInPageRetryDone = new Set();
 
 async function swGetSystemInfo() {
     const ua = navigator.userAgent;
@@ -64,8 +73,106 @@ async function swGetSystemInfo() {
     return { browser: browserLabel, os };
 }
 const capturePerfByTab = new Map();
-const tempImageStorage = new Map();
+// X-02: stub tempImageStorage (protocolo imgDataChunk purgado) eliminado junto
+// a sus 3 usos; queda el marcador MarkerPurge como constancia.
+try { console.log('[FEATURE_RUNTIME]', 'MarkerPurge removed=imgDataChunk+tempImageStorage+legacy-dom'); } catch (e) {}
 const captureImageDataByTab = new Map();
+
+// MEM-04: gobernador de memoria para los buffers por tab del SW. Los TTL por
+// sesión ya existían (stitch 60 s, PDF 90 s) pero sin cota global: N tabs
+// paralelas o sesiones atascadas retenían Blobs sin límite. Cotas + evicción
+// oldest-first (el orden de inserción del Map) + purga central por tab.
+// Solo actúa cuando se supera la cota; la ruta feliz no cambia.
+const MEM04_MAX_TABS = 8;
+const MEM04_MAX_BYTES = 400 * 1024 * 1024;
+function mem04ChunksBytes(chunks) {
+    let n = 0;
+    try {
+        if (chunks instanceof Map) { chunks.forEach((c) => { if (c && typeof c.size === 'number') n += c.size; }); }
+        else if (Array.isArray(chunks)) { for (let i = 0; i < chunks.length; i++) { const c = chunks[i]; if (c && typeof c.size === 'number') n += c.size; } }
+    } catch (e) {}
+    return n;
+}
+function mem04EntryBytes(entry) {
+    if (!entry) return 0;
+    let n = 0;
+    try {
+        if (entry.blob && typeof entry.blob.size === 'number') n += entry.blob.size;
+        n += mem04ChunksBytes(entry.chunks);
+    } catch (e) {}
+    return n;
+}
+function mem04Drop(map, name, key) {
+    const e = map.get(key);
+    if (e === undefined) return 0;
+    try { if (e && e.timer) clearTimeout(e.timer); } catch (x) {}
+    map.delete(key);
+    try { console.log('[FEATURE_RUNTIME]', 'MemEvict registry=' + name + ' tabId=' + key + ' bytes=' + mem04EntryBytes(e)); } catch (ex) {}
+    return 1;
+}
+function mem04Enforce(why) {
+    const regs = [
+        ['stitchBinarySessions', stitchBinarySessions],
+        ['pdfCaptureChunks', pdfCaptureChunks],
+        ['pdfLocalBuffers', pdfLocalBuffers],
+        ['captureImageDataByTab', captureImageDataByTab]
+    ];
+    let evicted = 0;
+    // Cota por conteo (sesiones concurrentes).
+    for (let r = 0; r < regs.length; r++) {
+        const name = regs[r][0], map = regs[r][1];
+        let guard = 0;
+        while (map.size > MEM04_MAX_TABS && guard++ < 64) {
+            const oldest = map.keys().next().value;
+            evicted += mem04Drop(map, name, oldest);
+        }
+    }
+    // Cota por bytes retenidos (suma de Blob.size, sin decodificar nada).
+    let guardB = 0;
+    for (;;) {
+        let total = 0;
+        for (let r = 0; r < regs.length; r++) {
+            const map = regs[r][1];
+            map.forEach((e) => { total += mem04EntryBytes(e); });
+        }
+        if (total <= MEM04_MAX_BYTES || guardB++ > 64) break;
+        let done = false;
+        for (let r = 0; r < regs.length && !done; r++) {
+            const name = regs[r][0], map = regs[r][1];
+            if (map.size > 0) { evicted += mem04Drop(map, name, map.keys().next().value); done = true; }
+        }
+        if (!done) break;
+    }
+    if (evicted > 0) {
+        try { console.log('[FEATURE_RUNTIME]', 'MemBudget evicted=' + evicted + ' why=' + why); } catch (e) {}
+    }
+    return evicted;
+}
+// Purga central de todo el estado por tab (timers incluidos). Llamadores:
+// onRemoved (tab muerto: 100% seguro), cancel-all (petición explícita).
+function purgeTabState(tabId, reason) {
+    if (tabId === null || tabId === undefined) return 0;
+    let n = 0;
+    try {
+        if (stitchBinarySessions.has(tabId)) n += mem04Drop(stitchBinarySessions, 'stitchBinarySessions', tabId);
+        if (pdfCaptureChunks.has(tabId)) n += mem04Drop(pdfCaptureChunks, 'pdfCaptureChunks', tabId);
+        if (pdfLocalBuffers.has(tabId)) n += mem04Drop(pdfLocalBuffers, 'pdfLocalBuffers', tabId);
+        if (captureImageDataByTab.has(tabId)) n += mem04Drop(captureImageDataByTab, 'captureImageDataByTab', tabId);
+        if (pdfCaptureTimerById.has(tabId)) {
+            try { clearTimeout(pdfCaptureTimerById.get(tabId)); } catch (e) {}
+            pdfCaptureTimerById.delete(tabId); n++;
+        }
+        if (pdfInPageTimerById.has(tabId)) {
+            try { clearTimeout(pdfInPageTimerById.get(tabId)); } catch (e) {}
+            pdfInPageTimerById.delete(tabId); n++;
+        }
+        if (capturePerfByTab.delete(tabId)) n++;
+        if (pdfPartialFallback.delete(tabId)) n++;
+        if (pdfInPageRetryDone.delete(tabId)) n++;
+    } catch (e) {}
+    try { console.log('[FEATURE_RUNTIME]', 'TabStatePurged tabId=' + tabId + ' entries=' + n + ' reason=' + reason); } catch (ex) {}
+    return n;
+}
 
 setHealingCleanup(() => clearHealingInterval());
 
@@ -84,11 +191,13 @@ chrome.runtime.onInstalled.addListener((details) => {
         chrome.tabs.create({ url: chrome.runtime.getURL('welcome.html') });
     }
     validarIconos();
+    initThemeIcon();
     setupKeepAlive();
 });
 
 chrome.runtime.onStartup.addListener(() => {
     validarIconos();
+    initThemeIcon();
     setupKeepAlive();
 });
 
@@ -113,16 +222,33 @@ async function setupKeepAlive() {
             if (typeof chrome.runtime.getContexts === 'function') {
                 const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
                 if (contexts.length > 0) {
-                    // Forzar recreación una vez para asegurar offscreen.html multipropósito (con pdf-render.js)
-                    // El viejo offscreen (solo keepalive) no tiene pdf-render listener
+                    // Reusar el documento si YA es el multipropósito (tiene el listener de
+                    // render PDF), en vez de recrearlo a ciegas.
+                    //
+                    // Por qué importa: este bloque se reevalúa en CADA activación del SW,
+                    // y pdf-render.js reporta progreso por runtime.sendMessage — o sea que
+                    // un render en curso despierta al SW y el closeDocument() de antes lo
+                    // mataba. Era invisible mientras chrome.offscreen no existía (faltaba el
+                    // permiso "offscreen" en el manifest).
+                    //
+                    // El sondeo es fiable: el popup no escucha mensajes del runtime,
+                    // runtime.sendMessage no llega a content scripts, y solo pdf-render.js
+                    // responde a 'sqaPing' con { pdf: true }.
+                    const pong = await pingOffscreenPdf(1200);
+                    if (pong && pong.pdf) {
+                        console.log('[offscreen] reuso del documento vivo (render PDF disponible)');
+                        return;
+                    }
+                    // Documento legado (solo keepalive, sin pdf-render.js): recrear una vez.
+                    console.log('[offscreen] documento legado sin render PDF — recreando');
                     try { await chrome.offscreen.closeDocument(); } catch {}
                     await new Promise(r => setTimeout(r, 400));
                 }
             }
             await chrome.offscreen.createDocument({
                 url: 'offscreen.html',
-                reasons: ['WORKERS'],
-                justification: 'Keepalive + render PDF (único Offscreen multipropósito MV3).'
+                reasons: ['WORKERS', 'MATCH_MEDIA'],
+                justification: 'Keepalive + render PDF + detección de tema (matchMedia).'
             });
             console.log('[offscreen] keepalive multipropósito creado');
             await new Promise(r => setTimeout(r, 500)); // margen para que offscreen.js + pdf-render.js registren listeners
@@ -138,19 +264,34 @@ setupKeepAlive();
 
 // --- Gestión de Icono y Tema ---
 
-// Cache de iconos para evitar recargar rutas cada vez
+// Cache de iconos para evitar recargar rutas cada vez.
+//
+// GENERADO desde Media/Logo_SQA.svg por tools/build-icons.mjs.
+// Chrome/Edge NO aceptan SVG como icono de toolbar: hay que rasterizar.
+// Las claves nombran el TEMA QUE SIRVEN, no el color del glifo:
+//   dark  -> toolbar oscuro  -> glifo CLARO  (#FFFFFF del SVG en prefers-color-scheme: dark)
+//   light -> toolbar claro   -> glifo OSCURO (#07162F, acento #F59C0C)
+// Encuadre: recorte al ink real de las letras (177x124) con la barra naranja
+// recolocada DENTRO de ese hueco (ver placeAccentInLines en build-icons.mjs).
+// El logo completo mide 245x133: escalarlo obligaba a usar 245 y el glifo
+// quedaba al 51% del cuadro. Moviendo el guion al hueco libre bajo la linea
+// base, el bbox no crece, el glifo sube al ~75% a 16 px y la marca se mantiene.
+//
+// OJO: estas rutas son el icono DINAMICO (setIcon). El icono estatico del
+// manifest (pagina de extensiones) es otro set — Media/SQAicon-*.png — porque
+// ese no puede cambiar con el tema y necesita fondo propio para leerse siempre.
 const ICON_CACHE = {
   dark: {
-    "16": "Media/SQA-16.png",
-    "32": "Media/SQA-32.png",
-    "48": "Media/SQA-48.png",
-    "128": "Media/SQA-128.png"
+    "16": "Media/SQAtoolbar-ondark-16.png",
+    "32": "Media/SQAtoolbar-ondark-32.png",
+    "48": "Media/SQAtoolbar-ondark-48.png",
+    "128": "Media/SQAtoolbar-ondark-128.png"
   },
   light: {
-    "16": "Media/SQA1-16.png",
-    "32": "Media/SQA1-32.png",
-    "48": "Media/SQA1-48.png",
-    "128": "Media/SQA1-128.png"
+    "16": "Media/SQAtoolbar-onlight-16.png",
+    "32": "Media/SQAtoolbar-onlight-32.png",
+    "48": "Media/SQAtoolbar-onlight-48.png",
+    "128": "Media/SQAtoolbar-onlight-128.png"
   }
 };
 
@@ -162,7 +303,17 @@ let iconCacheValid = false;
  */
 async function validarIconos() {
   try {
-    const allIcons = [...Object.values(ICON_CACHE.dark), ...Object.values(ICON_CACHE.light)];
+    // Se validan TAMBIEN los iconos del manifest (página de extensiones y
+    // diálogo de instalación). Son rutas distintas de ICON_CACHE y antes no se
+    // comprobaba ninguna: un archivo ausente ahí dejaba el icono invisible sin
+    // ningún rastro en consola.
+    const manifest = chrome.runtime.getManifest();
+    const allIcons = [...new Set([
+      ...Object.values(ICON_CACHE.dark),
+      ...Object.values(ICON_CACHE.light),
+      ...Object.values(manifest.icons || {}),
+      ...Object.values((manifest.action && manifest.action.default_icon) || {})
+    ])];
     const validationPromises = allIcons.map(async (iconPath) => {
       try {
         const response = await fetch(chrome.runtime.getURL(iconPath), { method: 'HEAD' });
@@ -183,7 +334,7 @@ async function validarIconos() {
     if (!iconCacheValid) {
       console.error('[SQA] Algunos iconos no están disponibles. Verifica el directorio Media/');
     } else {
-      console.log('[SQA] Validación de iconos completada exitosamente');
+      console.log(`[SQA] Validación de iconos completada exitosamente (${allIcons.length} rutas, incluye manifest.icons)`);
     }
   } catch (e) {
     console.error('[SQA] Error durante validación de iconos:', e.message);
@@ -194,8 +345,9 @@ async function validarIconos() {
 /**
  * Actualiza el icono de la extensión según el tema
  * @param {string} theme - 'dark' o 'light'
+ * @param {string} [source] - quién reporta el tema: offscreen | popup | storage
  */
-function actualizarIcono(theme) {
+function actualizarIcono(theme, source = 'unknown') {
   try {
     const isDark = theme === 'dark';
     const iconPaths = isDark ? ICON_CACHE.dark : ICON_CACHE.light;
@@ -203,14 +355,101 @@ function actualizarIcono(theme) {
     chrome.action.setIcon({ path: iconPaths }, () => {
       if (chrome.runtime.lastError) {
         console.error('[SQA] Error aplicando icono:', chrome.runtime.lastError.message);
+        console.log('[FEATURE_RUNTIME] IconAssignFailed theme=' + theme + ' src=' + source +
+          ' err=' + chrome.runtime.lastError.message);
       } else {
-        console.debug(`[SQA] Icono actualizado a tema: ${theme}`);
+        // Evidencia en la ruta real: antes era console.debug, que DevTools filtra
+        // por defecto (nivel Verbose), así que la asignación no era observable.
+        console.log('[FEATURE_RUNTIME] IconAssigned theme=' + theme +
+          ' set=' + (isDark ? 'ondark' : 'onlight') +
+          ' src=' + source +
+          ' sizes=' + Object.keys(iconPaths).join('/') + ' t=' + Date.now());
       }
     });
   } catch (e) {
     console.error('[SQA] Error inesperado en actualizarIcono:', e.message);
   }
 }
+
+// ============================================================================
+// Tema del icono: persistencia + reaplicación al arrancar
+// ----------------------------------------------------------------------------
+// El SW no puede detectar el tema (no tiene `window` ni `matchMedia`). Lo
+// reportan el documento offscreen (offscreen.js, al cargar y en cada cambio del
+// SO) y el popup (al abrirse). Aquí se persiste para reaplicarlo en cada
+// arranque sin esperar a que nadie avise, y se reaplica en onInstalled/onStartup.
+// ============================================================================
+const THEME_STORAGE_KEY = 'sqaTheme';
+
+function isValidTheme(t) { return t === 'dark' || t === 'light'; }
+
+async function persistTheme(theme) {
+    try { await chrome.storage.local.set({ [THEME_STORAGE_KEY]: theme }); } catch (e) {}
+}
+
+async function getPersistedTheme() {
+    try {
+        const stored = await chrome.storage.local.get(THEME_STORAGE_KEY);
+        const t = stored && stored[THEME_STORAGE_KEY];
+        return isValidTheme(t) ? t : null;
+    } catch (e) { return null; }
+}
+
+/** Reaplica el último tema conocido (evita el set equivocado del manifest al arrancar). */
+async function applyPersistedTheme() {
+    const theme = await getPersistedTheme();
+    if (theme) actualizarIcono(theme, 'storage');
+    else console.log('[FEATURE_RUNTIME] IconThemeUnknown src=storage (se espera reporte del offscreen)');
+}
+
+// ----------------------------------------------------------------------------
+// Detección de tema en el propio background
+// ----------------------------------------------------------------------------
+// Un service worker MV3 NO tiene `window` ni `matchMedia`. Pero una event page
+// (Firefox MV3) SÍ, y ahí la detección es directa. Es el workaround documentado
+// por la comunidad cuando no hay API declarativa (Chrome no la soporta: issue
+// https://issues.chromium.org/issues/41419485 sigue abierto).
+// Devuelve el tema aplicado, o null si este contexto no puede detectarlo.
+function detectThemeInBackground() {
+    if (typeof matchMedia !== 'function') return null;
+    const mq = matchMedia('(prefers-color-scheme: dark)');
+    const apply = (t, src) => { actualizarIcono(t, src); persistTheme(t); };
+    apply(mq.matches ? 'dark' : 'light', 'background');
+    try {
+        mq.addEventListener('change', (e) => apply(e.matches ? 'dark' : 'light', 'background:change'));
+    } catch (e) {}
+    return mq.matches ? 'dark' : 'light';
+}
+
+/**
+ * Deja constancia de qué mecanismos existen en este navegador, para que el
+ * diagnóstico del icono no dependa de adivinar. `src=` en IconAssigned dice
+ * después cuál ganó.
+ */
+function logIconEnv() {
+    const canMatchMedia = typeof matchMedia === 'function';
+    const canOffscreen = !!(typeof chrome !== 'undefined' && chrome.offscreen &&
+        typeof chrome.offscreen.createDocument === 'function');
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : 'n/a';
+    console.log(`[FEATURE_RUNTIME] IconEnv matchMedia=${canMatchMedia} offscreen=${canOffscreen} ua=${ua}`);
+}
+
+/**
+ * Cadena de resolución del tema, de mejor a peor:
+ *   1. background con matchMedia  (event page: Firefox MV3)
+ *   2. tema persistido            (evita el set fijo del manifest al arrancar)
+ *   3. reporte del offscreen      (Chromium; requiere permiso "offscreen")
+ *   4. reporte del popup          (siempre funciona, al abrirse)
+ */
+async function initThemeIcon() {
+    logIconEnv();
+    if (detectThemeInBackground()) return;
+    await applyPersistedTheme();
+}
+
+// Reaplicar el tema guardado en cuanto el módulo termina de evaluarse, para que
+// el icono no se quede con el set del manifest hasta que alguien avise.
+initThemeIcon();
 
 chrome.tabs.onActivated.addListener((info) => {
     chrome.tabs.get(info.tabId, (tab) => { if (tab) workerState.activeTab = tab; });
@@ -247,10 +486,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     const handlers = {
       'themeChanged': () => {
-        actualizarIcono(message.theme);
+        // Emisores: offscreen.js (detección real, en vivo) y popup.js (al abrirse).
+        if (!isValidTheme(message.theme)) {
+          console.warn('[SQA] themeChanged con tema inválido:', message.theme);
+          sendResponse({ ok: false, error: 'invalid theme' });
+          return;
+        }
+        const source = message.source === 'offscreen' ? 'offscreen'
+          : (sender && sender.tab ? 'popup' : 'message');
+        actualizarIcono(message.theme, source);
+        persistTheme(message.theme);
         // PERF_POPUP_STARTUP_001: ack con timestamp — la latencia percibida por el
         // popup entre ThemeMessageSent y ThemeMessageAck mide el wake del SW.
-        sendResponse({ ok: true, t: Date.now() });
+        sendResponse({ ok: true, t: Date.now(), applied: message.theme, source });
       },
         [ACTIONS.captureAll]: () => {
             if (message.tabId) chrome.tabs.get(message.tabId, t => executeCapture(t, "captureAllPageScreenshot"));
@@ -309,17 +557,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 tabId: tid
             });
         },
+        // X-01: el content enviaba "captureError" (3 emisores) sin consumidor en
+        // el SW → drop silencioso. Se enruta a error visible con traza runtime.
+        "captureError": () => {
+            const tid = (sender && sender.tab) ? sender.tab.id : captureStatus.tabId;
+            touchHeartbeat();
+            markCaptureError(message.message || 'Error en content script.', tid);
+            try { console.log('[FEATURE_RUNTIME]', 'ContentErrorRouted tabId=' + tid); } catch (e) {}
+        },
         "captureVisiblePageScreenshot": () => {
-            handleVisibleCaptureRequest(message, sender);
+            // PERF-04: se pasa sendResponse para adjuntar el screenshot inline
+            // (Blob vía structured_clone) en el getNowShotImgData del content.
+            handleVisibleCaptureRequest(message, sender, sendResponse);
         },
-        "requestCaptureScreenshot": () => {
-            const tabId = sender.tab ? sender.tab.id : workerState.activeTab?.id;
-            const imageData = tabId ? captureImageDataByTab.get(tabId) : workerState.nowShotImgData;
-            sendResponse({ imageData, y1: message.y1, y2: message.y2 });
-            if (tabId) captureImageDataByTab.delete(tabId);
-            else workerState.nowShotImgData = '';
-            return true;
-        },
+        // PERF-04b ELIMINADO: handler "requestCaptureScreenshot" (pull legacy de
+        // 2-8 MB dataURL por viewport). El content ya no lo solicita: el SW
+        // adjunta shotBlob inline en getNowShotImgData (BinaryChannel).
         "captureVisiblePageScreenshot4Selection": () => {
             handleVisibleCaptureForSelectionRequest(message, sender, false);
         },
@@ -355,9 +608,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 console.warn('[pdf] pdfCaptureRequest sin tabId');
                 sendResponse({ started: false });
             }
-        },
-        "pdfRenderProgress": () => {
+        },        "pdfRenderProgress": () => {
             touchHeartbeat();
+            try { sendResponse({ ok: true }); } catch (e) {}
             const tid = message.tabId || (sender && sender.tab && sender.tab.id);
             // FEATURE_PDF_UX_001: "Página X de N" (offscreen manda current/total).
             const pageMsg = showPdfPageProgress(message.current, message.total);
@@ -379,7 +632,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const tabId = message.tabId;
             if (!tabId) { sendResponse({ rtn: 0 }); return; }
             const entry = pdfCaptureChunks.get(tabId);
-            if (!entry) { sendResponse({ rtn: 0 }); return; }
+            if (!entry) {
+                // BUG_PDF_STALL_001: diagnóstico — el offscreen envía slices pero el SW
+                // ya no tiene el ensamblaje (timeout/cleanup). Sin esto, silencio total.
+                try { console.warn('[PDF_TRACE] CHUNK_DROPPED_NO_ENTRY', JSON.stringify({ t: Date.now(), tabId, index: message.index, total: message.total })); } catch (e) {}
+                sendResponse({ rtn: 1, index: message.index + 1000000 });
+                return;
+            }
+            if (!(message.blob instanceof Blob)) {
+                // BUG_PDF_STALL_001: un slice que no sobrevivió el postMessage no debe
+                // contaminar el ensamblaje; pedir reenvío (rtn:0) para este index.
+                try { console.warn('[PDF_TRACE] CHUNK_INVALID_NOT_BLOB', JSON.stringify({ t: Date.now(), tabId, index: message.index })); } catch (e) {}
+                sendResponse({ rtn: 0 });
+                return;
+            }
             if (!entry.chunks[message.index]) {
                 entry.chunks[message.index] = message.blob;
                 entry.received++;
@@ -397,6 +663,79 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
             sendResponse({ rtn: 1, index: message.index });
         },
+        // ===== PERF-03: canal binario content → SW para el stitch final =====
+        // Mismo patrón de ack/reintento que pdfRenderBlobChunk, con sesión propia.
+        "stitchBinaryProbe": () => {
+            try { console.log('[FEATURE_RUNTIME]', 'BinaryChannelProbe ok=true'); } catch (e) {}
+            sendResponse({ ok: true });
+        },
+        "stitchBinaryChunk": () => {
+            const tid = (sender && sender.tab) ? sender.tab.id : (message.tabId || null);
+            if (!tid) { sendResponse({ rtn: 0 }); return; }
+            if (!(message.blob instanceof Blob)) {
+                // Un slice que no sobrevivió la serialización no debe contaminar.
+                try { console.warn('[PERF]', JSON.stringify({ t: Date.now(), tabId: tid, op: 'stitch-chunk-invalid-not-blob', index: message.index })); } catch (e) {}
+                sendResponse({ rtn: 0 });
+                return;
+            }
+            let entry = stitchBinarySessions.get(tid);
+            if (!entry) {
+                entry = { chunks: new Map(), total: 0, received: 0, timer: null, tab: null, meta: null };
+                stitchBinarySessions.set(tid, entry);
+                mem04Enforce('stitch-create');
+                try { console.log('[FEATURE_RUNTIME]', 'StitchBinarySessionOpen tabId=' + tid); } catch (e) {}
+            }
+            if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+            entry.timer = setTimeout(() => {
+                try {
+                    const e2 = stitchBinarySessions.get(tid);
+                    if (e2) {
+                        console.warn('[PERF]', JSON.stringify({ t: Date.now(), tabId: tid, op: 'stitch-chunk-session-timeout', received: e2.received, total: e2.total }));
+                        stitchBinarySessions.delete(tid);
+                    }
+                } catch (e) {}
+            }, STITCH_CHUNK_TTL_MS);
+            if (!entry.chunks.has(message.index)) {
+                entry.chunks.set(message.index, message.blob);
+                entry.received++;
+            }
+            if (!entry.total && message.total) entry.total = message.total;
+            if (!entry.tab && sender && sender.tab) entry.tab = sender.tab;
+            if (!entry.meta && message.meta) entry.meta = message.meta;
+            const complete = entry.total > 0 && entry.received === entry.total;
+            if (complete) {
+                // Ordenar por índice: el reenvío puede reordenar llegadas.
+                const ordered = [];
+                for (let i = 0; i < entry.total; i++) {
+                    const c = entry.chunks.get(i);
+                    if (!c) { try { console.warn('[PERF]', JSON.stringify({ t: Date.now(), tabId: tid, op: 'stitch-chunk-missing', index: i })); } catch (e) {} break; }
+                    ordered.push(c);
+                }
+                if (ordered.length === entry.total) {
+                    const finalBlob = new Blob(ordered, { type: 'image/png' });
+                    const tab = entry.tab;
+                    const meta = entry.meta || {};
+                    if (entry.timer) { clearTimeout(entry.timer); entry.timer = null; }
+                    stitchBinarySessions.delete(tid);
+                    touchHeartbeat();
+                    try {
+                        console.log('[FEATURE_RUNTIME]', 'WireStats via=binary chunks=' + entry.total + ' bytes=' + finalBlob.size);
+                        console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId: tid, op: 'stitch-binary-assembled', bytes: finalBlob.size, chunks: entry.total }));
+                    } catch (e) {}
+                    processFinalImageBlob(finalBlob, tab, null, meta.browserName, meta.browserVersion, meta.os);
+                }
+            }
+            sendResponse({ rtn: 1, index: message.index });
+        },
+        "stitchBinaryComplete": () => {
+            // Señal de fin: permite detectar sesiones incompletas si un chunk final se perdió.
+            const tid = (sender && sender.tab) ? sender.tab.id : (message.tabId || null);
+            const entry = stitchBinarySessions.get(tid);
+            if (entry && entry.total > 0 && entry.received < entry.total) {
+                try { console.warn('[PERF]', JSON.stringify({ t: Date.now(), tabId: tid, op: 'stitch-binary-incomplete', received: entry.received, total: entry.total })); } catch (e) {}
+            }
+            sendResponse({ rtn: 1 });
+        },
         "pdfRenderError": () => {
             const tabId = message.tabId;
             pdfCaptureChunks.delete(tabId);
@@ -404,7 +743,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             log({ stage: 'pdf', status: 'failed', error: message.error || 'unknown pdf error' });
             finishPdfCaptureCleanup(tabId);
             markCaptureError(message.error || 'Error al renderizar PDF.', tabId);
-            if (tabId) { pdfPartialFallback.add(tabId); sendPdfVisibleFallback(tabId); }
+            // BUG_PDF_STALL_002: si el fallo vino del render offscreen de un PDF local
+            // (file://) y aún no reintentamos, reencaminar a render EN PÁGINA con los
+            // bytes ya leídos — misma calidad (documento completo), sin re-leer nada.
+            // Solo 1 reintento por tab: si también falla, degradar a captura visible.
+            const retryable = tabId && !pdfInPageRetryDone.has(tabId);
+            if (retryable) {
+                chrome.tabs.get(tabId, (tab) => {
+                    if (chrome.runtime.lastError || !tab || !tab.url || !tab.url.startsWith('file://')) {
+                        if (tabId) { pdfPartialFallback.add(tabId); sendPdfVisibleFallback(tabId); }
+                        return;
+                    }
+                    pdfInPageRetryDone.add(tabId);
+                    console.warn('[pdf] pdfRenderError → reintentando render en página (file://)', tabId, message.error);
+                    captureInProgress.add(tabId);
+                    renderInPageFallback(tabId, tab, null); // null: usa el fetch interno del SW
+                });
+            } else {
+                if (tabId) { pdfPartialFallback.add(tabId); sendPdfVisibleFallback(tabId); }
+            }
             sendResponse({ ok: true });
         },
         // BUG_PDF_FILE_001: chunks con los BYTES del PDF local (base64) leídos por el
@@ -466,6 +823,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         "pdfWorkerTrace": () => {
             try { console.log(String(message.text || '[PDF_WORKER_TRACE] (vacío)').slice(0, 500)); } catch (e) {}
             try { sendResponse({ ok: true }); } catch (e) {}
+        },
+        // BUG_PDF_CORS_001: el content en file:// (origen null) no puede hacer fetch al
+        // visor local por CORS. El SW sí puede (host_permissions <all_urls>).
+        "peekNextEvidenceId": () => {
+            (async () => {
+                try {
+                    const controller = new AbortController();
+                    const to = setTimeout(() => controller.abort(), 2000);
+                    const resp = await fetch(VIEWER_API_BASE_URL + '/api/peek-sequence', { signal: controller.signal });
+                    clearTimeout(to);
+                    if (!resp.ok) { sendResponse({ label: null }); return; }
+                    const data = await resp.json();
+                    sendResponse({ label: (data && data.success) ? data.label : null });
+                } catch (e) {
+                    try { sendResponse({ label: null }); } catch (_) {}
+                }
+            })();
+            return true;
         }
     };
 
@@ -483,11 +858,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
-    if (message.action.startsWith('imgDataChunk')) {
-        handleImageChunk(message, sender, sendResponse);
-        return true;
-    }
-
+    // FUNC-02: bloque imgDataChunk eliminado (sin productor; el binario vivo es
+    // pdfRenderBlobChunk + stitchBinaryChunk).
     if (handlers[message.action]) {
         log({ stage: 'capture', status: 'start', metadata: { action: message.action } });
         armHealingInterval();
@@ -500,25 +872,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-function scheduleTempImageCleanup(chunkId) {
-    const storage = tempImageStorage.get(chunkId);
-    if (!storage) return;
-    if (storage.cleanupTimer) clearTimeout(storage.cleanupTimer);
-    storage.cleanupTimer = setTimeout(() => {
-        tempImageStorage.delete(chunkId);
-    }, TEMP_IMAGE_STORAGE_TTL_MS);
-}
-
-function clearTempImageCleanup(chunkId) {
-    const storage = tempImageStorage.get(chunkId);
-    if (storage && storage.cleanupTimer) clearTimeout(storage.cleanupTimer);
-}
-
-function destroyChunkStorage(chunkId) {
-    clearTempImageCleanup(chunkId);
-    tempImageStorage.delete(chunkId);
-}
-
+// FUNC-02 (auditoría _002): handleImageChunk y sus helpers (scheduleTempImage
+// Cleanup / clearTempImageCleanup / destroyChunkStorage) eliminados junto al
+// protocolo imgDataChunk — sin productor en el repositorio.
 function startCapturePerf(tabId, mode) {
     if (!tabId) return;
     const now = performance.now();
@@ -543,12 +899,14 @@ function markCapturePerf(tabId, stage, extra = {}) {
     entry.lastMarkAt = now;
 }
 
-function finishCapturePerf(tabId) {
+function finishCapturePerf(tabId, label, extra = {}) {
     const entry = capturePerfByTab.get(tabId);
     if (!entry) return;
     // AUDIT_EXTWEB_REAL_PERF_001: vuelca la tabla de marcas (tiempos reales por etapa).
+    // X-06: la etiqueta antes se descartaba (5 sitios la pasaban); ahora constan
+    // label+extra en el volcado para distinguir la causa de cierre.
     try {
-        console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId, mode: entry.mode, totalMs: Math.round(performance.now() - entry.startedAt), marks: entry.marks }));
+        console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId, mode: entry.mode, end: label || 'ok', totalMs: Math.round(performance.now() - entry.startedAt), marks: entry.marks, ...extra }));
     } catch (e) {}
     capturePerfByTab.delete(tabId);
 }
@@ -710,16 +1068,8 @@ function finishPdfCaptureCleanup(tabId) {
 
 const pdfCaptureTimerById = new Map();
 
-function isPdfPageTab(tab) {
-    if (!tab || !tab.url) return false;
-    const url = tab.url || '';
-    if (url.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai')) return true;
-    if (/\.pdf(\?.*)?(#.*)?$/i.test(url) || /application\/pdf/i.test(url)) return true;
-    if (tab.title && /\.pdf($|[?#])/i.test(tab.title)) return true;
-    // Fallback: si la pestaña es PDF viewer sin .pdf en URL (blob: con content-type)
-    if (url.startsWith('blob:') && tab.title && tab.title.toLowerCase().includes('.pdf')) return true;
-    return false;
-}
+// X-05 ELIMINADO: isPdfPageTab() sin invocadores (el routing real usa
+// pdfRouteReason en capture-logic.js). Resto del bloque intacto.
 
 async function sendPdfVisibleFallback(tabId) {
     try {
@@ -879,6 +1229,7 @@ async function renderInPageFallback(tabId, tab, dataB64) {
 async function beginOffscreenPdfRender(tabId, tab, extra) {
     try {
     pdfCaptureChunks.set(tabId, { chunks: [], received: 0, total: null, tab });
+    mem04Enforce('pdf-create');
     const timer = setTimeout(() => {
         if (!pdfCaptureChunks.has(tabId)) return;
         finishPdfCaptureCleanup(tabId);
@@ -996,9 +1347,13 @@ async function startPdfCapture(tab) {
                 return;
             }
             markCapturePerf(tabId, 'local-bytes-read', { length: b64.length });
-            pdfRouteLog('route', Object.assign(pdfUrlInfo(tab), { route: 'offscreen-render', via: 'sw-fetch', bytes: b64.length }));
+            // PERF_PDF_INSTANT_001: el render offscreen se cuelga de forma consistente
+            // en page.render() (3 corridas: stall fase=render, timeout) mientras el
+            // render en página hace el MISMO documento en ~220ms. file:// va directo
+            // a in-page: captura en ~1s en vez de 25s de timeout + fallback.
+            pdfRouteLog('route', Object.assign(pdfUrlInfo(tab), { route: 'inpage-render', via: 'sw-fetch-direct', bytes: b64.length }));
             touchHeartbeat();
-            beginOffscreenPdfRender(tabId, tab, { data: b64, fileName: tab.title || '' });
+            renderInPageFallback(tabId, tab, b64);
             return;
         } catch (swErr) {
             log({ stage: 'pdf-local', status: 'sw-fetch-failed', error: swErr && swErr.message });
@@ -1032,6 +1387,7 @@ async function startPdfCapture(tab) {
                     sendPdfVisibleFallback(tabId);
                 }, CHUNK_TIMEOUT_MS * 3)
             });
+            mem04Enforce('pdflocal-create');
             markCapturePerf(tabId, 'local-bytes-requested');
             chrome.tabs.sendMessage(tabId, { action: 'readLocalPdfBytes' }, () => {
                 if (chrome.runtime.lastError) {
@@ -1101,7 +1457,11 @@ function isBlankImageData(dataUrl) {
     try {
         const commaIdx = dataUrl.indexOf(',');
         if (commaIdx === -1) return false;
-        const raw = atob(dataUrl.substring(commaIdx + 1));
+        // PERF-04b: muestra acotada (340 chars base64 = 255 bytes) en vez del
+        // atob() completo de 2-8 MB por viewport. Semántica preservada: capturas
+        // diminutas/fallidas (<100 B) y prefijos uniformes siguen detectándose;
+        // un PNG/JPEG válido difiere en los primeros 200 B (cabecera+IHDR).
+        const raw = atob(dataUrl.substring(commaIdx + 1, commaIdx + 341));
         if (raw.length < 100) return true;
         const sample = raw.charCodeAt(0);
         for (let i = 1; i < Math.min(raw.length, 200); i++) {
@@ -1113,7 +1473,7 @@ function isBlankImageData(dataUrl) {
     }
 }
 
-async function handleVisibleCaptureRequest(message, sender) {
+async function handleVisibleCaptureRequest(message, sender, sendResponse) {
     const targetTabId = sender.tab ? sender.tab.id : (workerState.activeTab ? workerState.activeTab.id : null);
     if (!targetTabId) return;
 
@@ -1142,7 +1502,7 @@ async function handleVisibleCaptureRequest(message, sender) {
         const tryCapture = async () => {
             attempt++;
             await waitForCaptureQuota();
-            chrome.tabs.captureVisibleTab(windowId, { format: CAPTURE_IMAGE_FORMAT }, (data) => {
+            chrome.tabs.captureVisibleTab(windowId, { format: CAPTURE_IMAGE_FORMAT }, async (data) => {
                 if (chrome.runtime.lastError) {
                     if (attempt < MAX) setTimeout(tryCapture, 150);
                     else {
@@ -1163,18 +1523,36 @@ async function handleVisibleCaptureRequest(message, sender) {
                     return;
                 }
                 
-                captureImageDataByTab.set(targetTabId, data);
-                markCapturePerf(targetTabId, 'visible-captured', { attempt });
+                // PERF-04: decodificar dataURL → Blob UNA sola vez en el SW y
+                // adjuntarlo inline en getNowShotImgData (structured_clone).
+                const shotBlob = await getBlobFromDataUrl(data, 'page-shot-inline');
+                if (!(shotBlob instanceof Blob) || shotBlob.size === 0) {
+                    // PERF-04b: sin retención dual dataURL y sin pull legacy. Fallo
+                    // visible en vez de stall silencioso de 15 s del watchdog.
+                    try { console.warn('[FEATURE_RUNTIME]', 'PageShotInlineFail fatal=inline-blob-decode'); } catch (e) {}
+                    finishCapturePerf(targetTabId, 'inline-blob-fail');
+                    markCaptureError('No se pudo preparar el screenshot del viewport (blob vacío).', targetTabId);
+                    return;
+                } else {
+                    // PERF-04b: solo Blob (antes {blob, dataUrl} dual = 2x memoria).
+                    captureImageDataByTab.set(targetTabId, { blob: shotBlob });
+                    mem04Enforce('shot-create');
+                }
+                try { console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId: targetTabId, op: 'page-shot-inline-ready', bytes: (shotBlob && shotBlob.size) || 0 })); } catch (e) {}
                 chrome.tabs.sendMessage(targetTabId, {
                     action: 'getNowShotImgData',
                     y1: message.y1, y2: message.y2,
-                    nextPageData: message.nextPageData
+                    nextPageData: message.nextPageData,
+                    shotBlob: (shotBlob instanceof Blob && shotBlob.size > 0) ? shotBlob : null
                 }, () => {
-                    if (chrome.runtime.lastError) {
+                    // PERF-04b: sin pull legacy ya no hay razón para conservar el
+                    // buffer ante un push fallido — liberarlo en ambos casos.
+                    captureImageDataByTab.delete(targetTabId);
+                    if (!chrome.runtime.lastError) {
+                        markCapturePerf(targetTabId, 'content-bridge-dispatched');
+                    } else {
                         finishCapturePerf(targetTabId, 'content-bridge-error', { message: chrome.runtime.lastError.message });
                         markCaptureError(chrome.runtime.lastError.message, targetTabId);
-                    } else {
-                        markCapturePerf(targetTabId, 'content-bridge-dispatched');
                     }
                 });
             });
@@ -1232,50 +1610,9 @@ function allChunksPresent(storage) {
     return true;
 }
 
-function handleImageChunk(message, sender, sendResponse) {
-    const chunkId = message.action;
-
-    if (!message || typeof message.dataIndex !== 'number' || typeof message.dataLength !== 'number') {
-        sendResponse({ rtn: 0, error: 'invalid chunk message' });
-        return;
-    }
-
-    if (message.dataIndex === 0 && !tempImageStorage.has(chunkId)) {
-        tempImageStorage.set(chunkId, {
-            chunks: new Array(message.dataLength),
-            receivedCount: 0,
-            cleanupTimer: null,
-            captureTimeout: setTimeout(() => {
-                destroyChunkStorage(chunkId);
-            }, CHUNK_TIMEOUT_MS)
-        });
-    }
-
-    const storage = tempImageStorage.get(chunkId);
-    if (!storage) {
-        sendResponse({ rtn: 1, index: message.dataIndex });
-        return;
-    }
-
-    if (storage.chunks[message.dataIndex] === undefined) {
-        storage.chunks[message.dataIndex] = message.dataItem;
-        storage.receivedCount++;
-    }
-    scheduleTempImageCleanup(chunkId);
-
-    if (storage.receivedCount === message.dataLength && allChunksPresent(storage)) {
-        clearTimeout(storage.captureTimeout);
-        if (sender.tab && sender.tab.id) {
-            markCapturePerf(sender.tab.id, 'all-chunks-received', { totalChunks: message.dataLength });
-        }
-        log({ stage: 'capture', status: 'success', metadata: { totalChunks: message.dataLength } });
-        touchHeartbeat();
-        const fullData = storage.chunks.join('');
-        destroyChunkStorage(chunkId);
-        processFinalImage(fullData, sender.tab);
-    }
-    sendResponse({ rtn: 1, index: message.dataIndex });
-}
+// FUNC-02 (auditoría _002): handleImageChunk eliminado junto al protocolo
+// imgDataChunk — sin productor en el repositorio. El transporte vivo es
+// pdfRenderBlobChunk (PDF) y stitchBinaryChunk (stitch final, PERF-03).
 
 async function processFinalImage(imageData, tab) {
     console.log('[PDF_TRACE] PROCESS_FINAL_IMAGE_START', {tabId: tab?.id, length: imageData?.length});
@@ -1399,6 +1736,9 @@ async function _finalizeCapture(imageBlob, imageDataUrl, tab, browserName, brows
     if (tabId) {
         markCapturePerf(tabId, 'completed', { totalMs: Math.round(performance.now() - startMs) });
         finishCapturePerf(tabId);
+        // MEM-05: permitir un nuevo reintento in-page en futuras capturas de esta
+        // pestaña (antes el Set solo se limpiaba en tabs.onRemoved).
+        pdfInPageRetryDone.delete(tabId);
     }
     clearHealingInterval();
     // BUG_PDF_001: si el PDF degradó a vista visible, el estado final debe decirlo.
@@ -1427,7 +1767,6 @@ function touchHeartbeat() {
 
 function isCaptureHealthy() {
     if (!captureStatus.active) return true;
-    if (tempImageStorage.size > 0) return true;
 
     const now = Date.now();
     const elapsed = now - captureStartTime;
@@ -1448,8 +1787,10 @@ function triggerSelfHealing(reason) {
     log({ stage: 'self-healing', status: 'triggered', reason, durationMs: elapsedMs });
 
     captureInProgress.activeTabs.clear();
-    tempImageStorage.clear();
     capturePerfByTab.clear();
+    // MEM-04: ante un atasco, podar sesiones viejas más allá de la cota (los
+    // TTL por sesión ya cubren el caso normal; esto acota el peor caso).
+    try { mem04Enforce('healing'); } catch (e) {}
     captureStartTime = 0;
     lastCaptureActivity = 0;
     updateCaptureStatus({ active: false, phase: 'idle', tabId: null });
@@ -1457,9 +1798,13 @@ function triggerSelfHealing(reason) {
 }
 
 function armHealingInterval() {
+    // Idempotente: se arma una vez por captura. Antes recreaba el intervalo en
+    // CADA mensaje (clearInterval+setInterval), y ahora también llegan mensajes
+    // de tema desde el offscreen, así que recrearlo sería churn puro.
+    // El latido se refresca aparte, con touchHeartbeat() en el despachador.
+    if (healingInterval !== null) return;
     captureStartTime = Date.now();
     touchHeartbeat();
-    clearHealingInterval();
     healingInterval = setInterval(() => {
         if (!isCaptureHealthy()) {
             triggerSelfHealing('stuck-detected');
@@ -1477,17 +1822,13 @@ function clearHealingInterval() {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-    const localEntry = pdfLocalBuffers.get(tabId);
-    if (localEntry) clearTimeout(localEntry.timer);
-    pdfLocalBuffers.delete(tabId);
-    if (pdfInPageTimerById.has(tabId)) {
-        try { clearTimeout(pdfInPageTimerById.get(tabId)); } catch (e) {}
-        pdfInPageTimerById.delete(tabId);
-    }
+    // MEM-04: purga central (timers + sesiones + perf + flags). Antes solo se
+    // limpiaban 4 estructuras y capturePerfByTab quedaba huérfano si la captura
+    // no estaba en captureInProgress.
+    purgeTabState(tabId, 'tab-removed');
     if (captureInProgress.has(tabId)) {
         clearHealingInterval();
         captureInProgress.delete(tabId);
-        capturePerfByTab.delete(tabId);
         updateCaptureStatus({ active: false, phase: 'idle', tabId: null });
     }
 });
@@ -1495,6 +1836,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 self.addEventListener('message', (event) => {
     if (event.data === 'cancel-all-captures') {
         clearHealingInterval();
+        // MEM-04: purga total del estado por tab (cancelación explícita).
+        try {
+            const ids = new Set();
+            [stitchBinarySessions, pdfCaptureChunks, pdfLocalBuffers, captureImageDataByTab].forEach((m) => {
+                try { m.forEach((_, k) => ids.add(k)); } catch (e) {}
+            });
+            ids.forEach((id) => purgeTabState(id, 'cancel-all'));
+        } catch (e) {}
         captureInProgress.activeTabs.clear();
         capturePerfByTab.clear();
         updateCaptureStatus({ active: false, phase: 'idle', tabId: null });

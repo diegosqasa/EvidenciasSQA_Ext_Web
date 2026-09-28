@@ -242,6 +242,7 @@ export async function executeCapture(tab, actionName) {
 
     captureInProgress.add(tab.id);
     workerState.activeTab = tab;
+    try { console.log('[FEATURE_RUNTIME]', 'CaptureRequested action=' + actionName + ' tabId=' + tab.id); } catch (e) {}
 
     updateCaptureStatus({
         active: true,
@@ -294,6 +295,7 @@ export async function executeCapture(tab, actionName) {
             try { console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId: tab.id, op: 'executeScript', ms: Math.round(performance.now() - execT0) })); } catch (e) {}
             await new Promise(r => setTimeout(r, 150));
         }
+        try { console.log('[FEATURE_RUNTIME]', 'ContentInjectDone injected=' + (!isLoaded) + ' ms=150'); } catch (e) {}
 
         const sent = await retrySendMessage(tab.id, { action: actionName });
         if (!sent) {

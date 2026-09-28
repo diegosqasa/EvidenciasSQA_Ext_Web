@@ -24,6 +24,7 @@ export async function getSqaHttpToken() {
         const now = Date.now();
         if (stored[TOKEN_CACHE_KEY] && stored[TOKEN_EXPIRY_KEY] && stored[TOKEN_EXPIRY_KEY] > now) {
             // Token válido en almacenamiento
+            setCachedToken(stored[TOKEN_CACHE_KEY]); // X-04: poblar caché en memoria
             return stored[TOKEN_CACHE_KEY];
         }
 
@@ -48,6 +49,7 @@ export async function getSqaHttpToken() {
 
         // Guardar en caché con expiración
         const expiry = now + TOKEN_TTL_MS;
+        setCachedToken(token); // X-04: poblar caché en memoria
         await chrome.storage.local.set({
             [TOKEN_CACHE_KEY]: token,
             [TOKEN_EXPIRY_KEY]: expiry

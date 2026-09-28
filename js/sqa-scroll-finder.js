@@ -179,6 +179,112 @@
         },
 
         /**
+         * PERF-06b: scoped candidate evaluation over the shared preScan walk.
+         * Same acceptance predicate as _findByDim (vertical), but iterates ONLY
+         * the pre-filtered candidates — no tree walk, no querySelectorAll, and
+         * getComputedStyle runs per candidate (a handful) instead of per node.
+         * `frames` likewise comes from the shared preScan (no querySelectorAll).
+         * Returns the same descriptor shape as find().
+         */
+        findFromCandidates(candidates, frames, windowWidth, windowHeight) {
+            windowWidth = windowWidth || window.innerWidth;
+            windowHeight = windowHeight || window.innerHeight;
+            const list = candidates || [];
+            let maxScroll = 0;
+            let bestElement = null;
+            let bestBounds = null;
+            let bestStyle = null;
+            for (let i = 0; i < list.length; i++) {
+                const element = list[i];
+                if (!element || element.nodeType !== 1) continue;
+                let offsetH, scrollH, offsetW;
+                try {
+                    offsetH = element.offsetHeight; scrollH = element.scrollHeight; offsetW = element.offsetWidth;
+                } catch (e) { continue; }
+                if (!(scrollH > offsetH + 5 && offsetH > 50 && scrollH > maxScroll && offsetW > 40)) continue;
+                let style;
+                try { style = getComputedStyle(element); } catch (e) { continue; }
+                const overflow = style.overflowY;
+                let isPerfectScrollbar = false;
+                try {
+                    isPerfectScrollbar = ['ps', 'ps-container'].some(function (c) { return element.classList.contains(c); }) &&
+                        ['ps-active-y', 'ps--active-y'].some(function (c) { return element.classList.contains(c); });
+                } catch (e) { isPerfectScrollbar = false; }
+                if (style.pointerEvents === 'none' ||
+                    !((overflow !== 'hidden' && overflow !== 'visible') || isPerfectScrollbar)) continue;
+                let bounds;
+                try { bounds = getBounds(element); } catch (e) { continue; }
+                const margin = 18;
+                if (bounds.left + margin >= 0 && bounds.left + bounds.width <= windowWidth + margin &&
+                    bounds.top + margin >= 0 && bounds.top + bounds.height <= windowHeight + margin) {
+                    bestBounds = bounds;
+                    maxScroll = scrollH;
+                    bestElement = element;
+                    bestStyle = style;
+                }
+            }
+            if (bestElement && bestElement !== document.body) {
+                let contentHeight = bestBounds.height;
+                let contentWidth = bestBounds.width;
+                const scrollWidth = bestElement.scrollWidth;
+                const scrollHeight = bestElement.scrollHeight;
+                if (bestStyle) {
+                    const perpOverflow = bestStyle.overflowX;
+                    if (perpOverflow === 'hidden') {
+                        const pl = parseFloat(bestStyle.paddingLeft) || 0;
+                        const pr = parseFloat(bestStyle.paddingRight) || 0;
+                        bestBounds.left += pl;
+                        contentWidth -= pl + pr;
+                    }
+                }
+                return {
+                    type: 'elt',
+                    elt: bestElement,
+                    scrollHeight: Math.max(contentHeight, scrollHeight),
+                    scrollWidth: Math.max(contentWidth, scrollWidth),
+                    top: bestBounds.top,
+                    bottom: bestBounds.top + contentHeight,
+                    left: bestBounds.left,
+                    right: bestBounds.left + contentWidth,
+                    height: contentHeight,
+                    width: contentWidth,
+                    ready: true
+                };
+            }
+            // Frame fallback over the shared preScan frame list (no querySelectorAll).
+            const flist = frames || [];
+            const minArea = Math.min(windowWidth * windowHeight / 4, 180000);
+            let bestArea = 0;
+            let bestFrame = null;
+            for (let k = 0; k < flist.length; k++) {
+                const frame = flist[k];
+                if (!frame || frame.nodeType !== 1) continue;
+                let bounds;
+                try { bounds = getBounds(frame); } catch (e) { continue; }
+                const area = bounds.width * bounds.height;
+                if (area >= minArea && area > bestArea &&
+                    bounds.left + 18 >= 0 && bounds.left + bounds.width <= windowWidth + 18 &&
+                    bounds.top + 18 >= 0 && bounds.top + bounds.height <= windowHeight + 18) {
+                    bestArea = area;
+                    bestFrame = {
+                        type: 'frame',
+                        frame: frame,
+                        width: bounds.width,
+                        height: bounds.height,
+                        top: bounds.top,
+                        left: bounds.left,
+                        url: frame.src,
+                        tagName: (frame.tagName || 'iframe').toLowerCase(),
+                        bottom: bounds.top + bounds.height,
+                        right: bounds.left + bounds.width,
+                        ready: false
+                    };
+                }
+            }
+            return bestFrame || this._empty();
+        },
+
+        /**
          * Find best scrollable element in one dimension (vertical or horizontal).
          */
         _findByDim(root, vertical) {

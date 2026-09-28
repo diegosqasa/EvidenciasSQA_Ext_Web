@@ -11,8 +11,52 @@ const TARGET_WIDTH = 1500;          // ancho objetivo en px (A4 ≈ 2x)
 const MAX_CANVAS_HEIGHT = 30000;    // límite de altura del canvas (Chrome: 32767)
 const SLICE_BYTES = 1500000;        // ~1.5MB binario por mensaje (D2: sin base64)
 
+// BUG_PDF_STALL_001: el sendToSw original ignoraba lastError; si el SW se suspende
+// entre fases, el render sigue vivo en offscreen pero el SW nunca ve nada — y el
+// usuario no percibe nada hasta el timeout de 90s. Loguear el error revela la fase.
+function reportToSwConsole(message, level = 'log') {
+    try { chrome.runtime.sendMessage({ action: 'pdfWorkerTrace', text: message }); } catch (e) {}
+    try {
+        if (level === 'error') console.error(message);
+        else console.log(message);
+    } catch (e) {}
+}
+
 function sendToSw(message) {
-    try { chrome.runtime.sendMessage(message); } catch (e) {}
+    try {
+        chrome.runtime.sendMessage(message, () => {
+            // BUG_PDF_STALL_001: ignorar lastError provocaba silencio total si el SW
+            // se suspendía entre fases (render vivo, SW sordo). Registrar la fase.
+            if (chrome.runtime.lastError) {
+                console.warn('[pdf-render] sendToSw fallo (' + (message && message.action) + '):', chrome.runtime.lastError.message);
+            }
+        });
+    } catch (e) {
+        console.warn('[pdf-render] sendToSw excepción (' + (message && message.action) + '):', e.message);
+    }
+}
+
+// BUG_PDF_STALL_001: vigilante por fase. Si una fase (parse, getDocument, render
+// de página, encode) se queda sin progreso, se reporta y despierta al SW para que
+// el pipeline de failover (timeout → fallback parcial) tenga datos y canal vivo.
+const PHASE_TIMEOUT_MS = 45000; // pdf.js puede tardar en PDFs complejos; < timeout SW (90s)
+let phaseTimer = null;
+let lastPhase = '';
+
+function cancelCurrentPhaseTimer() {
+    if (phaseTimer) { clearTimeout(phaseTimer); phaseTimer = null; }
+}
+
+function markPhase(tabId, phase) {
+    lastPhase = phase;
+    cancelCurrentPhaseTimer();
+    phaseTimer = setTimeout(() => {
+        // BUG_PDF_STALL_002: el estancamiento ahora es ACCIONABLE — se envía
+        // pdfRenderError para que el SW reintente en página (tiene los bytes) en vez
+        // de colgar al usuario hasta el timeout de 90s.
+        reportToSwConsole('[PDF_TRACE] PDF_RENDER_STALLED phase=' + phase + ' tabId=' + tabId, 'error');
+        try { chrome.runtime.sendMessage({ action: 'pdfRenderError', tabId, error: 'Render estancado en fase ' + phase + ' (sin progreso ' + Math.round(PHASE_TIMEOUT_MS / 1000) + 's)' }); } catch (e) {}
+    }, PHASE_TIMEOUT_MS);
 }
 
 function sendProgress(tabId, progress, current, total) {
@@ -32,6 +76,7 @@ async function renderPdf(message) {
     const { pdfUrl, tabId } = message;
     // AUDIT_EXTWEB_REAL_PERF_001: marcas por fase (se publican al final vía pdfPerf).
     const prT0 = performance.now();
+    markPhase(tabId, 'parse'); // BUG_PDF_STALL_001
     console.log('[PDF_TRACE] PDF_RENDER_START', { pdfUrl: (pdfUrl || '(local buffer)').slice(0, 120), tabId });
     console.log('[pdf-render] renderPdf iniciado', { pdfUrl: (pdfUrl || '(local buffer)').slice(0, 120), tabId });
     let buffer;
@@ -66,12 +111,21 @@ async function renderPdf(message) {
     const pdf = await getDocument({
         data: buffer,
         isEvalSupported: false,
-        useSystemFonts: true
+        useSystemFonts: true,
+        // BUG_PDF_STALL_002/003: el render se colgaba en page.render() dentro del
+        // documento offscreen. disableFontFace NO lo eliminó (3 corridas con stall),
+        // así que la causa no era FontFace. Siguiente candidato: la decodificación de
+        // imágenes vía OffscreenCanvas/createImageBitmap (el PDF de prueba tiene logo),
+        // que dentro de un offscreen document puede no resolver. Se desactiva; si aun
+        // así se cuelga, el timeout por página (8s) + reintento en página lo cubren.
+        disableFontFace: true,
+        isOffscreenCanvasSupported: false
     }).promise;
 
     const prTFetch = performance.now();
     try { console.log('[PDF_ROUTE]', JSON.stringify({ t: Date.now(), event: 'render-start', tabId, numPages: pdf.numPages, source: message.data ? 'local-buffer' : 'fetch-url' })); } catch (e) {}
     const prTDoc = performance.now();
+    markPhase(tabId, 'pages'); // BUG_PDF_STALL_001: vigilar bucle getPage/viewport
     sendProgress(tabId, 15);
 
     const pages = [];
@@ -105,10 +159,33 @@ async function renderPdf(message) {
 
     let y = 0;
     let rendered = 0;
+    markPhase(tabId, 'render'); // BUG_PDF_STALL_001: info de páginas lista — vigilar render de páginas
+    // BUG_PDF_STALL_002: timeout por página. Si un page.render() no resuelve,
+    // se cancela la tarea y se aborta TODO el render con el número de página —
+    // el SW lo reencamina a render en página con los bytes ya leídos.
+    const PAGE_RENDER_TIMEOUT_MS = 8000; // BUG_PDF_STALL_003: 25s→8s — fallar rápido y ceder al render en página (que hace el trabajo en ~220ms)
     for (const { page, w, h } of pages) {
         const viewport = page.getViewport({ scale });
         const pageCanvas = new OffscreenCanvas(Math.ceil(w * scale), Math.ceil(h * scale));
-        await page.render({ canvasContext: pageCanvas.getContext('2d', { alpha: false }), viewport }).promise;
+        const renderTask = page.render({ canvasContext: pageCanvas.getContext('2d', { alpha: false }), viewport });
+        let pageTimer = null;
+        try {
+            await Promise.race([
+                renderTask.promise,
+                new Promise((_, reject) => {
+                    pageTimer = setTimeout(() => reject(new Error('Render de página estancado (timeout ' + Math.round(PAGE_RENDER_TIMEOUT_MS / 1000) + 's)')), PAGE_RENDER_TIMEOUT_MS);
+                })
+            ]);
+            clearTimeout(pageTimer);
+        } catch (err) {
+            clearTimeout(pageTimer);
+            try { renderTask.cancel(); } catch (e) {}
+            pageCanvas.width = 0;
+            pageCanvas.height = 0;
+            try { page.cleanup(); } catch (e) {}
+            const detail = (err && err.message) ? err.message : String(err);
+            throw new Error(detail + ' [página ' + (rendered + 1) + ']');
+        }
         ctx.drawImage(pageCanvas, 0, y);
         y += Math.ceil(h * scale);
         pageCanvas.width = 0;
@@ -118,6 +195,7 @@ async function renderPdf(message) {
         sendProgress(tabId, 50 + Math.round((y / H) * 30), rendered, pages.length);
     }
 
+    markPhase(tabId, 'blob'); // BUG_PDF_STALL_001: render completo — vigilar encode
     sendProgress(tabId, 82);
     const prTRender = performance.now();
     console.log('[PDF_TRACE] PDF_CANVAS_RENDERED', {W, H, pages: pages.length});
@@ -130,15 +208,68 @@ async function renderPdf(message) {
     // el SW ensambla con new Blob() en pdfRenderBlobChunk. Ahorra FileReader +33% wire + atob.
     const total = Math.max(1, Math.ceil(blob.size / SLICE_BYTES));
 
+    // BUG_PDF_STALL_001: confirmación por chunk del SW (rtn:1). Si un slice no llegó
+    // (SW suspendido en MV3 entre mensajes), se reenvía hasta 3 veces; si el SW
+    // confirma index >= total (ensamblado ya completado), se aborta el reenvío.
+    // La versión anterior ignoraba la respuesta: un solo slice perdido dejaba la
+    // captura muerta en silencio hasta el timeout de 90s.
+    const MAX_CHUNK_ATTEMPTS = 3;
+    const sendChunkWithAck = (chunkMsg, attempt = 1) => new Promise((resolve) => {
+        let settled = false;
+        const to = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reportToSwConsole('[PDF_TRACE] PDF_CHUNK_NO_ACK idx=' + chunkMsg.index + ' attempt=' + attempt, 'warn');
+            if (attempt < MAX_CHUNK_ATTEMPTS) resolve(sendChunkWithAck(chunkMsg, attempt + 1));
+            else resolve(true); // continuar con el resto; el ensamblador es tolerante
+        }, 8000);
+        try {
+            chrome.runtime.sendMessage(chunkMsg, (resp) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(to);
+                const lastErr = chrome.runtime.lastError;
+                if (lastErr) {
+                    reportToSwConsole('[PDF_TRACE] PDF_CHUNK_ERR idx=' + chunkMsg.index + ' attempt=' + attempt + ' ' + lastErr.message, 'warn');
+                    if (attempt < MAX_CHUNK_ATTEMPTS) resolve(sendChunkWithAck(chunkMsg, attempt + 1));
+                    else resolve(true);
+                    return;
+                }
+                if (resp && resp.rtn === 1) {
+                    // index >= total ⇒ el SW ensambló y ya procesó la captura: abortar reenvío.
+                    if (resp.index >= chunkMsg.total) resolve(false);
+                    else resolve(true);
+                } else {
+                    // rtn:0 ⇒ slice rechazado (p.ej. blob no clonado): reenviar este index.
+                    reportToSwConsole('[PDF_TRACE] PDF_CHUNK_REJECTED idx=' + chunkMsg.index + ' attempt=' + attempt, 'warn');
+                    if (attempt < MAX_CHUNK_ATTEMPTS) resolve(sendChunkWithAck(chunkMsg, attempt + 1));
+                    else resolve(true);
+                }
+            });
+        } catch (e) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(to);
+            reportToSwConsole('[PDF_TRACE] PDF_CHUNK_EXC idx=' + chunkMsg.index + ' attempt=' + attempt + ' ' + e.message, 'warn');
+            if (attempt < MAX_CHUNK_ATTEMPTS) resolve(sendChunkWithAck(chunkMsg, attempt + 1));
+            else resolve(true);
+        }
+    });
+
     for (let i = 0; i < total; i++) {
-        sendToSw({
+        const chunkMsg = {
             action: 'pdfRenderBlobChunk',
             tabId,
             index: i,
             total,
             blob: blob.slice(i * SLICE_BYTES, (i + 1) * SLICE_BYTES, 'image/png')
-        });
+        };
+        const keepGoing = await sendChunkWithAck(chunkMsg);
+        if (!keepGoing) { lastPhase = 'done'; cancelCurrentPhaseTimer(); return; }
     }
+
+    cancelCurrentPhaseTimer(); // BUG_PDF_STALL_001: todo entregado — apagar watchdog
+    lastPhase = 'done';
 
     try { await pdf.destroy(); } catch (e) {}
     const prTSent = performance.now();
@@ -162,8 +293,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try { sendResponse({ received: true }); } catch {}
     renderPdf(message)
         .catch((err) => {
-            console.error('[pdf-render] Error:', err && err.message ? err.message : err);
-            sendToSw({ action: 'pdfRenderError', tabId: message.tabId, error: String((err && err.message) || err) });
+            cancelCurrentPhaseTimer();
+            const detail = String((err && err.message) || err);
+            console.error('[pdf-render] Error:', detail);
+            // BUG_PDF_STALL_001: anexar la fase donde murió (parse/pages/render/blob)
+            sendToSw({ action: 'pdfRenderError', tabId: message.tabId, error: lastPhase ? detail + ' [fase: ' + lastPhase + ']' : detail });
         });
     return false;
 });

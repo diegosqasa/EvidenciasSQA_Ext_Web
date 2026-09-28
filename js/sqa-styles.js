@@ -19,10 +19,24 @@
 
     const POSITIONED = new Set(['absolute', 'fixed', 'relative', 'sticky']);
 
+    // PERF-01: stash de estilos computados por captura. El escaneo único calcula
+    // UN getComputedStyle por nodo y el clasificador/convertidor lo reutilizan.
+    let _styleStash = null;
+
+    // FEATURE_RUNTIME: trazas obligatorias de clasificación (PERF-01).
+    function frLog(msg) { try { console.log('[FEATURE_RUNTIME] ' + msg); } catch (e) {} }
+
+    /** getComputedStyle con stash: 1 cálculo por nodo y por captura. */
+    function styleOf(el) {
+        let s = _styleStash && _styleStash.get(el);
+        if (!s) { s = getComputedStyle(el); if (_styleStash) _styleStash.set(el, s); }
+        return s;
+    }
+
     /** CSS transform matrix helper */
     function getTransformMatrix(el) {
         if (window.DOMMatrix || window.WebKitCSSMatrix) {
-            const s = getComputedStyle(el);
+            const s = styleOf(el);
             const t = s.transform || s.webkitTransform;
             return window.DOMMatrix ? new DOMMatrix(t) : new WebKitCSSMatrix(t);
         }
@@ -65,13 +79,45 @@
         _styleStack: [],    // normal style overrides (restored via popAll)
         _fixedStack: [],    // fixed-element overrides (restored via popAllFixed)
         _styleTag: null,
+        // PERF-01 FASE 1: CaptureClassificationCache — clasificación O(N) UNA vez por captura.
+        _captureActive: false,
+        _classCache: null,      // { fixedElts, stickyElts, fixedBg, fixedHeader, nodes }
+        _mutObserver: null,     // FASE 4: invalidación por crecimiento estructural (nunca por scroll)
+        _mutSuspended: false,
+        _mutDirty: false,
+        _mutAdded: 0,
+        _mutThreshold: 400,
+        _cacheUses: 0,
+        _hiddenHeaders: null,
+        _convertedElts: null,   // fixed→absolute ya aplicado (idempotencia por captura)
+        _bgHandled: null,       // fixedBg ya procesado
+        _floaterElts: null,     // FLOATING_001: flotantes intactos en vp0, ocultos desde vp1
+        _floaterHidden: null,
+        _stickyApplied: false,
 
         // ── INIT ──────────────────────────────────────────────────────────────
 
         /** Initialize all style overrides for capture */
         init() {
+            // PERF-01: idempotente por captura. Antes se ejecutaba en CADA viewport
+            // (changStyleForShot por página): reiniciaba los stacks (=> restoreAll solo
+            // restauraba la última página) y añadía un <style> de transitions/scrollbars
+            // por página (fuga DOM). Ahora corre una vez por captura.
+            if (this._captureActive) return;
+            this._captureActive = true;
             this._styleStack = [];
             this._fixedStack = [];
+            this._classCache = null;
+            this._mutDirty = false;
+            this._mutAdded = 0;
+            this._mutSuspended = false;
+            this._cacheUses = 0;
+            this._hiddenHeaders = new WeakSet();
+            this._convertedElts = new WeakSet();
+            this._bgHandled = new WeakSet();
+            this._floaterElts = [];
+            this._floaterHidden = new WeakSet();
+            this._stickyApplied = false;
 
             // scrollBehavior: auto on <html>
             this._add(document.documentElement, { scrollBehavior: 'auto' });
@@ -88,6 +134,127 @@
             this._hideScrollbars();
             this._disableTransitions();
             this._hacks();
+
+            // FASE 4: observer AL FINAL — las inyecciones <style> del propio init
+            // no deben invalidar la caché que aún no existe.
+            this._observeMutations();
+        },
+
+        // ── PERF-01: CaptureClassificationCache ─────────────────────────────
+
+        /** Fuerza estado limpio si una captura previa quedó sin restoreAll (abort/error). */
+        beginCapture() {
+            if (this._captureActive) {
+                frLog('ClassificationCacheInvalidated reason=CAPTURE_ABORTED_WITHOUT_RESTORE');
+                this._endCapture();
+            }
+        },
+
+        /** Fin de captura: libera caché, observer y stash (no retener nodos). */
+        _endCapture() {
+            this._disposeMutations();
+            this._captureActive = false;
+            this._classCache = null;
+            this._mutSuspended = false;
+            this._mutDirty = false;
+            this._mutAdded = 0;
+            this._cacheUses = 0;
+            this._hiddenHeaders = null;
+            this._convertedElts = null;
+            this._bgHandled = null;
+            this._floaterElts = null;
+            this._floaterHidden = null;
+            this._stickyApplied = false;
+            _styleStash = null;
+        },
+
+        /**
+         * FASE 4: invalidación controlada — solo crecimiento estructural del documento
+         * (nodos añadidos/eliminados) y solo SIGNIFICATIVO (> _mutThreshold, relativo
+         * al tamaño clasificado). El scroll y los atributos NO reclasifican.
+         */
+        _observeMutations() {
+            if (this._mutObserver || typeof MutationObserver === 'undefined') return;
+            try {
+                this._mutObserver = new MutationObserver((records) => {
+                    if (this._mutSuspended) return;
+                    for (let i = 0; i < records.length; i++) {
+                        const r = records[i];
+                        if (r.type !== 'childList') continue;
+                        const added = r.addedNodes.length;
+                        const removed = r.removedNodes.length;
+                        if (!added && !removed) continue;
+                        this._mutAdded += added;
+                        if (this._mutAdded > this._mutThreshold) {
+                            this._mutDirty = true;
+                            break;
+                        }
+                    }
+                });
+                const target = document.body || document.documentElement;
+                if (target) this._mutObserver.observe(target, { childList: true, subtree: true, attributes: false, characterData: false });
+            } catch (e) {
+                this._mutObserver = null;
+            }
+        },
+
+        _disposeMutations() {
+            if (this._mutObserver) {
+                try { this._mutObserver.disconnect(); } catch (e) {}
+                this._mutObserver = null;
+            }
+        },
+
+        /**
+         * FASE 1/2: acceso a la CaptureClassificationCache. Construye UNA vez
+         * (StyleClassificationStart/Completed) y reutiliza en todos los viewports
+         * siguientes (UpdateFixedMode=CACHE). Solo reconstruye por crecimiento
+         * significativo del DOM (FASE 4), nunca por scroll.
+         */
+        _getClassificationCache() {
+            if (this._classCache) {
+                if (this._mutDirty) {
+                    frLog('ClassificationCacheInvalidated reason=DOM_GROWTH addedNodes=' + this._mutAdded);
+                    frLog('UpdateFixedMode=FULL_SCAN');
+                    this._classCache = null;
+                    this._mutDirty = false;
+                    this._mutAdded = 0;
+                    // continúa a reconstrucción puntual
+                } else {
+                    this._cacheUses++;
+                    frLog('UpdateFixedMode=CACHE');
+                    frLog('ClassificationCacheUsed uses=' + this._cacheUses + ' ClassificationCacheHit');
+                    return this._classCache;
+                }
+            }
+            return this._buildClassificationCache();
+        },
+
+        _buildClassificationCache() {
+            frLog('StyleClassificationStart');
+            const t0 = (window.performance && performance.now) ? performance.now() : 0;
+            frLog('ClassificationCacheCreated');
+            const cache = { fixedElts: [], stickyElts: [], fixedBg: [], fixedHeader: [], nodes: 0 };
+            // Stash de estilos SOLO durante el escaneo único: 1 getComputedStyle por
+            // nodo visitado; se libera al terminar (memoria acotada).
+            _styleStash = new Map();
+            try {
+                this._classifyElements(cache);
+            } finally {
+                _styleStash = null;
+            }
+            const dt = t0 ? Math.round(performance.now() - t0) : -1;
+            // Umbral de invalidación relativo al documento clasificado (FASE 4).
+            this._mutThreshold = Math.max(200, Math.round(cache.nodes * 0.1));
+            this._mutAdded = 0;
+            this._mutDirty = false;
+            frLog('ClassifiedNodes=' + cache.nodes);
+            frLog('FixedElementsDetected=' + cache.fixedElts.length);
+            frLog('StickyElementsDetected=' + cache.stickyElts.length);
+            frLog('FloatingElementsDetected=' + cache.fixedBg.length);
+            frLog('StyleClassificationCompleted timeMs=' + dt + ' cached=' + (cache.fixedElts.length + cache.stickyElts.length + cache.fixedHeader.length + cache.fixedBg.length));
+            this._classCache = cache;
+            return cache;
         },
 
         // ── FIXED → ABSOLUTE ──────────────────────────────────────────────────
@@ -99,24 +266,54 @@
          * @param {boolean} [isTopCapture=false] — whether this is the top capture
          */
         updateFixed(scrollableHeight, scrollableWidth, isTopCapture) {
-            const fixedElts = [];
-            const stickyElts = [];
-            const fixedBg = [];
-            const fixedHeader = [];
+            // PERF-01 FASE 2: reutiliza la CaptureClassificationCache. NUNCA re-escanea
+            // el DOM por viewport; la única reclasificación permitida es por crecimiento
+            // estructural significativo (FASE 4, resuelta dentro de _getClassificationCache).
+            const cache = this._getClassificationCache();
+            const fixedElts = cache.fixedElts, stickyElts = cache.stickyElts;
+            const fixedBg = cache.fixedBg, fixedHeader = cache.fixedHeader;
 
-            // Classify all elements
-            this._classifyElements(fixedElts, stickyElts, fixedBg, fixedHeader);
-
-            // Hide fixed headers on non-top captures
+            // Hide fixed headers on non-top captures (una vez por elemento y captura;
+            // antes se re-apilaba cssText duplicado en cada viewport — MEM-03)
             if (!isTopCapture) {
                 for (const elt of fixedHeader) {
+                    if (this._hiddenHeaders.has(elt)) continue;
+                    this._hiddenHeaders.add(elt);
                     this._addFixed(elt, { visibility: 'hidden', overflow: 'hidden' });
                 }
             }
 
-            // Convert fixed → absolute
+            // Convert fixed → absolute (idempotente: una vez por elemento y captura;
+            // la geometría absoluta calculada en el primer viewport es válida para todos)
+            let _floatKept = 0;
             for (const elt of fixedElts) {
+                if (this._convertedElts.has(elt)) continue;
+                this._convertedElts.add(elt);
+
                 const style = getComputedStyle(elt);
+                // FLOATING_001 rev2: botones flotantes (lupa, ayuda ?, chat). El pin
+                // por coordenadas los dejaba mal ubicados (el absolute es relativo al
+                // offsetParent, no al documento). Estrategia fiel: se dejan FIXED en
+                // el primer viewport (salen en su posicion real, como Edge nativo) y
+                // se ocultan desde el segundo (una sola ocurrencia, jamas duplican).
+                try {
+                    const _fr = elt.getBoundingClientRect();
+                    const _fw = _fr.width || elt.offsetWidth || 0;
+                    const _fh = _fr.height || elt.offsetHeight || 0;
+                    const _area = _fw * _fh;
+                    const _topAuto = !style.top || style.top === 'auto';
+                    const _leftAuto = !style.left || style.left === 'auto';
+                    const _rightSet = style.right && style.right !== 'auto';
+                    const _bottomSet = style.bottom && style.bottom !== 'auto';
+                    const _nearRight = (_fr.right > window.innerWidth - 120);
+                    const _nearEdgeV = (_fr.top < 160) || (_fr.bottom > window.innerHeight - 160);
+                    if (_area > 0 && _area < 40000 && ((_rightSet && _leftAuto) || (_bottomSet && _topAuto) || (_nearRight && _nearEdgeV))) {
+                        if (this._floaterElts.indexOf(elt) === -1) this._floaterElts.push(elt);
+                        _floatKept++;
+                        frLog('FixedFloatKept w=' + Math.round(_fw) + ' h=' + Math.round(_fh) + ' screenTop=' + Math.round(_fr.top) + ' screenLeft=' + Math.round(_fr.left) + ' mode=keep-fixed-vp0');
+                        continue;
+                    }
+                } catch (e) {}
                 const oldLeft = pxToFloat(style.left);
                 const oldRight = pxToFloat(style.right);
                 const oldTop = pxToFloat(style.top);
@@ -195,38 +392,78 @@
                     this._addFixed(elt, updates);
                 }
             }
+            try { frLog('FloatingPreserved count=' + _floatKept + ' fixedTotal=' + fixedElts.length); } catch (e) {}
 
-            // Convert sticky → relative
-            const stickyIds = [];
-            for (const elt of stickyElts) {
-                this._add(elt, {
-                    position: 'relative',
-                    top: 'auto', left: 'auto', right: 'auto', bottom: 'auto'
-                });
-                if (!elt.id) elt.id = `__sqa_id_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-                stickyIds.push(elt.id);
+            // Convert sticky → relative (una sola vez por captura; antes inyectaba un
+            // <style> duplicado por viewport). Excepcion FLOATING_001 rev2: un sticky
+            // pequeno pegado al borde derecho es un boton flotante (ej. ayuda ?), no
+            // contenido: se deja intacto en vp0 y se oculta desde vp1 (ver bloque
+            // FloatHidden abajo). Convertirlo a relative le quita su anclaje y lo
+            // desplaza a posicion estatica (desaparece o sale mal ubicado).
+            if (!this._stickyApplied) {
+                this._stickyApplied = true;
+                const stickyIds = [];
+                for (const elt of stickyElts) {
+                    let _isFloater = false;
+                    try {
+                        const _sr = elt.getBoundingClientRect();
+                        const _sw = _sr.width || elt.offsetWidth || 0;
+                        const _sh = _sr.height || elt.offsetHeight || 0;
+                        if (_sw > 0 && _sh > 0 && (_sw * _sh) < 40000 && _sh < 200 && (_sr.right > window.innerWidth - 120)) {
+                            _isFloater = true;
+                            if (this._floaterElts.indexOf(elt) === -1) this._floaterElts.push(elt);
+                            frLog('StickyFloatKept w=' + Math.round(_sw) + ' h=' + Math.round(_sh) + ' screenTop=' + Math.round(_sr.top) + ' screenLeft=' + Math.round(_sr.left) + ' mode=keep-vp0');
+                        }
+                    } catch (e) {}
+                    if (_isFloater) continue;
+                    this._add(elt, {
+                        position: 'relative',
+                        top: 'auto', left: 'auto', right: 'auto', bottom: 'auto'
+                    });
+                    if (!elt.id) elt.id = `__sqa_id_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+                    stickyIds.push(elt.id);
+                }
+
+                // Apply sticky override via stylesheet
+                if (stickyIds.length) {
+                    const selector = stickyIds.map(id => `#${CSS.escape(id)}`).join(',');
+                    this._addStyleSheet(`${selector} { position: relative !important; left: auto !important; right: auto !important; top: auto !important; bottom: auto !important; }`);
+                }
             }
 
-            // Apply sticky override via stylesheet
-            if (stickyIds.length) {
-                const selector = stickyIds.map(id => `#${CSS.escape(id)}`).join(',');
-                this._addStyleSheet(`${selector} { position: relative !important; left: auto !important; right: auto !important; top: auto !important; bottom: auto !important; }`);
-            }
-
-            // Hide small inner absolutes
+            // Hide small inner absolutes (una vez por elemento y captura)
             for (const elt of fixedBg) {
+                if (this._bgHandled.has(elt)) continue;
+                this._bgHandled.add(elt);
                 if (elt.offsetWidth * elt.offsetHeight < 5000) {
                     this._add(elt, { display: 'none' });
                 } else {
                     this._add(elt, { backgroundAttachment: 'scroll' });
                 }
             }
+
+            // FLOATING_001 rev2: los flotantes se dejaron FIXED/intactos en vp0 para
+            // salir en posicion real; desde vp1 se ocultan (visibility, sin layout
+            // shift) para que aparezcan UNA sola vez. restoreAll los restaura.
+            if (!isTopCapture && this._floaterElts && this._floaterElts.length) {
+                let _hid = 0;
+                for (const elt of this._floaterElts) {
+                    if (this._floaterHidden.has(elt)) continue;
+                    this._floaterHidden.add(elt);
+                    this._addFixed(elt, { visibility: 'hidden' });
+                    _hid++;
+                }
+                if (_hid) frLog('FloatHidden count=' + _hid);
+            }
         },
 
         /**
          * Classify elements into fixed, sticky, fixedBg, fixedHeader categories.
+         * PERF-01 FASE 1: corre UNA vez por captura (llamado solo desde
+         * _buildClassificationCache) y llena la CaptureClassificationCache.
+         * Usa el stash de estilos: 1 getComputedStyle por nodo en vez de 3.
          */
-        _classifyElements(fixed, sticky, fixedBg, fixedHeader) {
+        _classifyElements(cache) {
             const root = document.body;
             if (!root) return;
 
@@ -235,12 +472,13 @@
             while (walker.hasNext()) {
                 const elt = walker.next();
                 if (elt === root) continue;
+                cache.nodes++;
 
-                const style = getComputedStyle(elt);
+                const style = styleOf(elt);
                 const pos = style.position;
 
                 if (pos === 'sticky') {
-                    sticky.push(elt);
+                    cache.stickyElts.push(elt);
                 } else if (pos === 'fixed') {
                     const bounds = getBounds(elt);
 
@@ -248,7 +486,7 @@
                     if (bounds.top < 20 && bounds.height < window.innerHeight - 20) {
                         // Skip if has overflow:hidden parent
                         if (!this._hasOverflowHiddenParent(elt)) {
-                            fixedHeader.push(elt);
+                            cache.fixedHeader.push(elt);
                         }
                     }
                     // Offscreen fixed: skip
@@ -267,12 +505,12 @@
                         // Skip
                     }
                     else {
-                        fixed.push(elt);
+                        cache.fixedElts.push(elt);
                     }
                 }
 
                 if (style.backgroundAttachment === 'fixed') {
-                    fixedBg.push(elt);
+                    cache.fixedBg.push(elt);
                 }
             }
         },
@@ -280,7 +518,7 @@
         _hasOverflowHiddenParent(element) {
             let parent = element.parentNode;
             while (parent && parent !== document.documentElement && parent !== document.body) {
-                if (getComputedStyle(parent).overflow === 'hidden') return true;
+                if (styleOf(parent).overflow === 'hidden') return true;
                 parent = parent.parentNode;
             }
             return false;
@@ -434,6 +672,9 @@
         restoreAll() {
             this.popAll();
             this.popAllFixed();
+            // PERF-01: fin de captura → libera caché de clasificación, observer y stash
+            // (no retener referencias a nodos entre capturas).
+            this._endCapture();
         }
     };
 
@@ -451,8 +692,8 @@
                 const children = Array.from(item.childNodes).filter(
                     n => n.nodeType === Node.ELEMENT_NODE &&
                         !IGNORED_NODE_NAMES.has(n.nodeName) &&
-                        getComputedStyle(n).display !== 'none' &&
-                        getComputedStyle(n).visibility !== 'hidden'
+                        styleOf(n).display !== 'none' &&
+                        styleOf(n).visibility !== 'hidden'
                 );
                 this.stack.push(...children);
             }

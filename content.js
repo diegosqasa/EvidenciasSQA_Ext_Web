@@ -7,6 +7,85 @@
 	let contextInvalidated = false;
 	let _lastBrowserInfo = { browserName: "N/A", fullVersion: "N/A" };
 	let _lastOS = "N/A";
+	// PERF-10: caché de 1 valor para el ID de evidencia (evita await de red en el header).
+	let _evidenceIdCache = null;
+
+	// ===== PERF-03 (auditoría _002): canal binario content → SW =====
+	// Un Blob sobrevive chrome.runtime.sendMessage solo con el opt-in de manifest
+	// "message_serialization": "structured_clone" (Chrome >= 148). Detectamos la
+	// capacidad 1 vez por documento (probe) y hacemos fallback a dataURL.
+	let _stitchProbeDone = false;
+	let _stitchBinaryOK = false;
+	function stitchBinaryProbe(cb) {
+		if (_stitchProbeDone) { cb(_stitchBinaryOK); return; }
+		_stitchProbeDone = true;
+		let settled = false;
+		const finish = function (ok) {
+			if (settled) return;
+			settled = true;
+			_stitchBinaryOK = !!ok;
+			try { console.log('[FEATURE_RUNTIME]', 'BinaryChannelProbe result=' + (ok ? 'structured-clone' : 'json-fallback')); } catch (e) {}
+			cb(_stitchBinaryOK);
+		};
+		try {
+			chrome.runtime.sendMessage({ action: 'stitchBinaryProbe', marker: new Blob([1]) }, function (resp) {
+				const err = chrome.runtime.lastError;
+				finish(!err && !!resp && resp.ok === true);
+			});
+		} catch (e) { finish(false); }
+	}
+	// Envía blob en slices de 1.5MB con ack por chunk (patrón pdfRenderBlobChunk).
+	// onSuccess: entrega binaria completa. onFail: fallback dataURL del llamador.
+	function sendFinalBlobBinary(blob, meta, onFail, tag) {
+		if (!(blob instanceof Blob) || typeof OffscreenCanvas === 'undefined') { onFail(); return; }
+		stitchBinaryProbe(function (ok) {
+			if (!ok) { onFail(); return; }
+		const SLICE = 1536 * 1024;
+		const total = Math.max(1, Math.ceil(blob.size / SLICE));
+		let aborted = false;
+		const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+		try { console.log('[FEATURE_RUNTIME]', 'BinaryChannelStart tag=' + (tag || 'stitch') + ' chunks=' + total + ' bytes=' + blob.size); } catch (e) {}
+			const sendNext = function (i) {
+				if (aborted) return;
+				if (i >= total) {
+					try { chrome.runtime.sendMessage({ action: 'stitchBinaryComplete', total: total }); } catch (e) {}
+					try { console.log('[FEATURE_RUNTIME]', 'WireStats via=binary chunks=' + total + ' bytes=' + blob.size + ' base64Bytes=0 ms=' + Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0) + ' tag=' + (tag || 'stitch')); } catch (e) {}
+					return;
+				}
+				let slice;
+				try { slice = blob.slice(i * SLICE, Math.min((i + 1) * SLICE, blob.size), 'application/octet-stream'); }
+				catch (e) { aborted = true; onFail(); return; }
+				let msg;
+				try { msg = { action: 'stitchBinaryChunk', index: i, total: total, blob: slice, meta: (i === 0 ? meta : null) }; }
+				catch (e) { aborted = true; onFail(); return; }
+				try {
+					chrome.runtime.sendMessage(msg, function (resp) {
+						if (aborted) return;
+						const err = chrome.runtime.lastError;
+						if (err || !resp || resp.rtn !== 1) {
+							aborted = true;
+							try { console.warn('[FEATURE_RUNTIME]', 'BinaryChannelFallback reason=' + (err ? err.message : ('ack-malformed index=' + i))); } catch (e) {}
+							onFail();
+							return;
+						}
+						try { console.log('[FEATURE_RUNTIME]', 'BinaryChunkAck index=' + i); } catch (e) {}
+						sendNext(i + 1);
+					});
+				} catch (e) {
+					aborted = true; onFail();
+				}
+			};
+			sendNext(0);
+		});
+	}
+	// ===== fin PERF-03 =====
+
+	// ===== PERF-04 (auditoría _002): captura por página inline =====
+	// Contadores de ruta para validación FEATURE_RUNTIME (PageShotSource).
+	let _pageShotBlobPages = 0;
+	let _pageShotDataUrlPages = 0;
+	// ===== fin PERF-04 =====
+
 	if (window.hasInjectedContentScript) {
 		try {
 			chrome.runtime.getURL('');
@@ -181,11 +260,30 @@
 			return os;
 		}
 		async function fetchNextEvidenceId() {
+			// BUG_PDF_CORS_001: fetch directo al visor desde content script (origen null en
+			// file://) muere con CORS — el visor no manda Access-Control-Allow-Origin. Se
+			// enruta por el SW (host_permissions <all_urls> → sin CORS). Fallback silencioso.
+			// PERF-10: caché de 1 valor — el primer header lanza la consulta y los
+			// siguientes reutilizan el resultado (cero esperas de red en el camino crítico).
+			if (_evidenceIdCache !== null) {
+				try { console.log('[FEATURE_RUNTIME]', 'EvidenceIdCacheHit label=' + _evidenceIdCache); } catch (e) {}
+				return _evidenceIdCache;
+			}
 			try {
-				const resp = await fetch('http://127.0.0.1:3000/api/peek-sequence');
-				if (!resp.ok) return null;
-				const data = await resp.json();
-				return data.success ? data.label : null;
+				const resp = await new Promise((resolve, reject) => {
+					try {
+						chrome.runtime.sendMessage({ action: 'peekNextEvidenceId' }, (r) => {
+							if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+							resolve(r || null);
+						});
+					} catch (e) { reject(e); }
+				});
+				if (resp && resp.label) {
+					_evidenceIdCache = resp.label;
+					try { console.log('[FEATURE_RUNTIME]', 'EvidenceIdCacheSet label=' + _evidenceIdCache); } catch (e) {}
+					return _evidenceIdCache;
+				}
+				return null;
 			} catch (e) {
 				return null;
 			}
@@ -264,7 +362,9 @@
 						try { wtrace('worker setup FAILED', e.message); } catch (_) {}
 					}
 					try { wtrace('worker after', lib.GlobalWorkerOptions.workerSrc); } catch (e) {}
-					return await lib.getDocument({ data: data, isEvalSupported: false, useSystemFonts: true }).promise;
+					// MEM-04: el blob URL del worker ya no se necesita una vez que
+					// getDocument cargó el PDF — revocarlo libera el recurso retenido.
+					try { if (window.__sqaPdfWorkerUrl) { URL.revokeObjectURL(window.__sqaPdfWorkerUrl); window.__sqaPdfWorkerUrl = null; try { wtrace('blobUrl revoked post-getDocument'); } catch (_) {} } } catch (e) {}
 				}
 				const raw = atob(b64);
 				const u8 = new Uint8Array(raw.length);
@@ -316,20 +416,22 @@
 						try { chrome.runtime.sendMessage({ action: 'pdfInPageError', error: 'toBlob nulo' }); } catch (e) {}
 						return;
 					}
-					// BUG_PDF_DD_001: Chrome serializa runtime messages a JSON (sin opt-in
-					// "message_serialization": "structured_clone", requiere Chrome >= 148).
-					// Un Blob llega al SW como {} y processFinalImageBlob aborta en silencio
-					// (service-worker.js:1317). Se envía DataURL (string JSON-safe), mismo
-					// patrón del path de stitch. convMs/convBytes conservan la métrica D2.
-					var frT0dd = Date.now();
-					var frdd = new FileReader();
-					frdd.onload = function () {
-						try { chrome.runtime.sendMessage({ action: 'processFinalImageBlob', imageBlob: frdd.result, renderMs: Date.now() - inpageT0, convMs: Date.now() - frT0dd, convBytes: blob.size, convOut: (frdd.result && frdd.result.length) || 0 }); } catch (e) {}
-					};
-					frdd.onerror = function () {
-						try { chrome.runtime.sendMessage({ action: 'pdfInPageError', error: 'FileReader fallo al convertir PNG en pagina' }); } catch (e) {}
-					};
-					frdd.readAsDataURL(blob);
+					// PERF-03: el PNG del render en página viaja por el canal binario
+					// (Blob sobrevive con el opt-in structured_clone de manifest.json,
+					// Chrome >= 148); fallback dataURL legacy (JSON-safe) si el probe o
+					// algún chunk fallan. convMs/convBytes conservan la métrica D2.
+					const metaDD = { renderMs: Date.now() - inpageT0 };
+					sendFinalBlobBinary(blob, metaDD, function () {
+						var frT0dd = Date.now();
+						var frdd = new FileReader();
+						frdd.onload = function () {
+							try { chrome.runtime.sendMessage({ action: 'processFinalImageBlob', imageBlob: frdd.result, renderMs: Date.now() - inpageT0, convMs: Date.now() - frT0dd, convBytes: blob.size, convOut: (frdd.result && frdd.result.length) || 0 }); } catch (e) {}
+						};
+						frdd.onerror = function () {
+							try { chrome.runtime.sendMessage({ action: 'pdfInPageError', error: 'FileReader fallo al convertir PNG en pagina' }); } catch (e) {}
+						};
+						frdd.readAsDataURL(blob);
+					}, 'pdf-inpage');
 				}, 'image/png');
 			} catch (e) {
 				try { chrome.runtime.sendMessage({ action: 'pdfInPageError', error: e.message }); } catch (_) {}
@@ -351,7 +453,10 @@
 				// Timeout de seguridad: si la imagen no carga en 5s, dibujamos sin logo
 				let resolved = false;
 				const safeResolve = () => { if (!resolved) { resolved = true; finHeader(); } };
-				const timer = setTimeout(() => { safeResolve(); }, 5000);
+				const timer =					// PERF-09: ventana del transform 80 → 40 ms (el observer de crecimiento
+					// y los reflows del sitio son la señal real, no el sleep fijo).
+					setTimeout(() => {
+						try { console.log('[FEATURE_RUNTIME]', 'ScrollTransformWait ms=40'); } catch (e) {} safeResolve(); }, 5000);
 
 				async function finHeader() {
 					try {
@@ -433,19 +538,223 @@
 		let capturex_preRealPageCrollTop;
 		let capturex_scrollbarWidth;
 		let capturex_changStyleForShotTimes = 0;
-		let elementAbsolutePositions = new WeakMap();
 
 		// Micro‑opt: bounding rect cache (WeakMap)
 		let _bboxCache = new WeakMap();
+		// PERF-07: caché del rect visible compuesto (1 cálculo por elemento y captura).
+		let _visibleRectCache = new WeakMap();
+		// PERF-06: prefijos de alturas — prefix[k] = suma de heights[0..k-1] (O(1) por consulta).
+		function buildHeightPrefix(heights) {
+			if (!heights || heights.length === 0) return null;
+			const prefix = new Array(heights.length + 1);
+			prefix[0] = 0;
+			for (let k = 0; k < heights.length; k++) prefix[k + 1] = prefix[k] + heights[k];
+			return prefix;
+		}
 		function _getCachedRect(el) {
 			let r = _bboxCache.get(el);
 			if (!r) { r = el.getBoundingClientRect(); _bboxCache.set(el, r); }
 			return r;
 		}
-		function _clearBBoxCache() { _bboxCache = new WeakMap(); }
+		function _clearBBoxCache() { _bboxCache = new WeakMap(); _visibleRectCache = new WeakMap(); }
 
 		// Micro‑opt: scroll dedup set
 		let capturex_capturedScrollTops = null;
+
+		// STITCH_DUPLICATED_VIEWPORT_REGRESSION_001: posiciones REALES ya capturadas
+		// (evidencia: entre viewports consecutivos nunca debe repetirse actualY).
+		let capturex_capturedRealTops = [];
+
+		// LOG-01: compuerta de verbosidad para los ticks por frame. Los resúmenes
+		// por viewport (ViewportTarget/Actual/Delta/Capture, ViewportStabilize,
+		// ViewportRescroll) SIEMPRE se emiten (evidencia obligatoria); los ticks
+		// intermedios se silencian con window.__SQA_QUIET_RUNTIME=true o
+		// localStorage.sqaQuietRuntime=1. Por defecto todo sigue visible.
+		function sqaFrTick(msg) {
+			try {
+				if (window.__SQA_QUIET_RUNTIME === true) return;
+				try { if (typeof localStorage !== 'undefined' && localStorage.getItem('sqaQuietRuntime') === '1') return; } catch (e) {}
+				console.log('[FEATURE_RUNTIME]', msg);
+			} catch (e) {}
+		}
+
+		// Estabilización pre-captura (antes vivía solo dentro de captureVisiblePageScreenshot;
+		// captureSelectAllPageScreenshot quedó con una referencia huérfana → ReferenceError).
+		function sqaAfterFrameStable(fn, targetY, vpIndex) {
+			let frames = 0;
+			const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+			let lastTop = capturex_com_saveAction.getPageScrollTop();
+			function tick() {
+				frames++;
+				const top = capturex_com_saveAction.getPageScrollTop();
+				if (targetY != null) { sqaFrTick('ScrollStableCheck phase=pre index=' + vpIndex + ' target=' + targetY + ' actual=' + top + ' delta=' + (top - targetY) + ' frames=' + frames); }
+				if ((top === lastTop && frames >= 1) || frames >= 3) {
+					try { console.log('[FEATURE_RUNTIME]', 'ViewportStabilize frames=' + frames + ' ms=' + Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0)); } catch (e) {}
+					fn(); return;
+				}
+				lastTop = top;
+				requestAnimationFrame(function(){ setTimeout(tick, 0); });
+			}
+			requestAnimationFrame(function(){ setTimeout(tick, 0); });
+		}
+
+		// Verificación POST-scroll: confirma que la posición real llegó al objetivo ANTES
+		// de pedir el screenshot. Causa raíz del viewport duplicado (AvalPay): la captura
+		// salía con el frame presentado del scroll ANTERIOR cuando el compositor no
+		// alcanzaba a pintar el nuevo scroll (la estabilidad se medía ANTES de aplicar
+		// el scroll, así que no decía nada de la posición nueva).
+		function sqaAfterScrollApplied(targetY, vpIndex, cb) {
+			let frames = 0;
+			let rounds = 0;
+			const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+			function resolve(top) {
+				const delta = top - targetY;
+				try { console.log('[FEATURE_RUNTIME]', 'ViewportActual index=' + vpIndex + ' actualY=' + top + ' delta=' + delta + ' frames=' + frames + ' ms=' + Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0)); } catch (e) {}
+				try { console.log('[FEATURE_RUNTIME]', 'ViewportDelta index=' + vpIndex + ' delta=' + delta); } catch (e) {}
+				let dup = false;
+				for (let k = 0; k < capturex_capturedRealTops.length; k++) { if (Math.abs(capturex_capturedRealTops[k] - top) <= 2) { dup = true; break; } }
+				capturex_capturedRealTops.push(top);
+				if (dup) { try { console.log('[FEATURE_RUNTIME]', 'ViewportDuplicateDetected index=' + vpIndex + ' actualY=' + top); } catch (e) {} }
+				try { console.log('[FEATURE_RUNTIME]', 'ViewportCapture index=' + vpIndex + ' y=' + top); } catch (e) {}
+				cb();
+			}
+			function tick() {
+				frames++;
+				const top = capturex_com_saveAction.getPageScrollTop();
+				sqaFrTick('ScrollStableCheck phase=post index=' + vpIndex + ' target=' + targetY + ' actual=' + top + ' delta=' + (top - targetY) + ' frames=' + frames);
+				if (Math.abs(top - targetY) <= 2) {
+					// Scroll asentado: 1 rAF extra para que el compositor presente el
+					// frame nuevo antes del captureVisibleTab (evita capturar el frame anterior).
+					requestAnimationFrame(function(){ setTimeout(function(){ resolve(capturex_com_saveAction.getPageScrollTop()); }, 0); });
+					return;
+				}
+				if (frames >= 3) {
+					// H1 (AvalPay / scroll-behavior:smooth o compositor lento): el layout
+					// dice que el scroll no llego. Re-aplicar instant y reintentar (acotado:
+					// max 3 rondas ~= 9-12 frames, sin sleeps fijos -> PERF-09 intacto).
+					if (rounds < 3) {
+						rounds++;
+						try { console.log('[FEATURE_RUNTIME]', 'ViewportRescroll index=' + vpIndex + ' round=' + rounds + ' target=' + targetY + ' actual=' + top); } catch (e) {}
+						try { capturex_com_saveAction.scrollTopForCapture(targetY); } catch (e) {}
+						frames = 0;
+						requestAnimationFrame(function(){ setTimeout(tick, 0); });
+						return;
+					}
+					resolve(top); return;
+				}
+				requestAnimationFrame(function(){ setTimeout(tick, 0); });
+			}
+			const top0 = capturex_com_saveAction.getPageScrollTop();
+			if (Math.abs(top0 - targetY) <= 2) {
+				// Scroll ya aplicado (instant): 1 rAF para que el frame con el nuevo scroll
+				// llegue a presentar antes del captureVisibleTab (PERF-09 intacto: sin esperas fijas).
+				try { console.log('[FEATURE_RUNTIME]', 'ScrollStableCheck phase=post index=' + vpIndex + ' target=' + targetY + ' actual=' + top0 + ' delta=0 frames=0 fast-path'); } catch (e) {}
+				requestAnimationFrame(function(){ setTimeout(function(){ resolve(capturex_com_saveAction.getPageScrollTop()); }, 0); });
+				return;
+			}
+			requestAnimationFrame(function(){ setTimeout(tick, 0); });
+		}
+
+
+		// PERF-01 FASE 5: clasificación única del fallback. Se construye UNA vez por
+		// captura (primer viewport que entra al fallback) y los viewports siguientes
+		// reutilizan la lista — en vez de querySelectorAll(':not(...)+getComputedStyle')
+		// O(N) en cada página.
+		let _fallbackClassified = null;
+		function _classifyOnceForFallback() {
+			if (_fallbackClassified) {
+				try { console.log('[FEATURE_RUNTIME] ClassificationCacheUsed path=fallback nodes=' + _fallbackClassified.length + ' ClassificationCacheHit'); } catch (e) {}
+				return _fallbackClassified;
+			}
+			try { console.log('[FEATURE_RUNTIME] StyleClassificationStart path=fallback'); } catch (e) {}
+			const t0 = performance.now();
+			const scope = capturex_contentEle || document;
+			const all = scope.querySelectorAll('*');
+			const result = [];
+			for (let i = 0; i < all.length; i++) {
+				const el = all[i];
+				if (!(el instanceof Element)) continue;
+				let cs;
+				try { cs = getComputedStyle(el); } catch (e) { continue; }
+				const pos = cs.position;
+				// Solo conservamos los nodos que el loop de estilo puede modificar:
+				// sticky, fixed y los 'absolute' candidatos a changStyleForFullShot.
+				if (pos === 'sticky' || pos === 'fixed' || pos === 'absolute') result.push({ el, pos });
+				continue;
+			}
+			try { console.log('[FEATURE_RUNTIME] ClassifiedNodes=' + all.length); } catch (e) {}
+			try { console.log('[FEATURE_RUNTIME] FixedElementsDetected=' + result.filter(r => r.pos === 'fixed').length); } catch (e) {}
+			try { console.log('[FEATURE_RUNTIME] StickyElementsDetected=' + result.filter(r => r.pos === 'sticky').length); } catch (e) {}
+			try { console.log('[FEATURE_RUNTIME] FloatingElementsDetected=' + result.length); } catch (e) {}
+			try { console.log('[FEATURE_RUNTIME] StyleClassificationCompleted path=fallback timeMs=' + Math.round(performance.now() - t0) + ' kept=' + result.length); } catch (e) {}
+			try { console.log('[FEATURE_RUNTIME] ClassificationCacheCreated path=fallback'); } catch (e) {}
+			_fallbackClassified = result;
+			return result;
+		}
+		function _resetFallbackClassification() {
+			if (_fallbackClassified) {
+				try { console.log('[FEATURE_RUNTIME] ClassificationCacheInvalidated reason=CAPTURE_RESET'); } catch (e) {}
+			}
+			_fallbackClassified = null;
+		}
+
+		// ========================================================================
+		// PERF-02/MEM-01: Bitmap Streaming (ventana deslizante).
+		// Sustituye a `Promise.all(items.map(createImageBitmap))`, que decodificaba
+		// TODOS los cortes simultáneamente (≈18 MB/página a DPR 2 → pico >500 MB en
+		// capturas de 30 páginas). Mantiene ≤ BITMAP_WINDOW bitmaps vivos, dibuja en
+		// orden y hace close() inmediato tras drawImage(). Resultado visual idéntico.
+		// ========================================================================
+		const BITMAP_WINDOW = 4;
+		function bitmapFrLog(msg) { try { console.log('[FEATURE_RUNTIME] ' + msg); } catch (e) {} }
+
+		async function decodeBitmapStreaming(sources, onItem) {
+			const total = sources.length;
+			bitmapFrLog('StitchMemoryMode=STREAMING');
+			bitmapFrLog('BitmapWindowStart segments=' + total);
+			bitmapFrLog('BitmapWindowSize=' + BITMAP_WINDOW);
+			let open = 0;    // bitmaps decodificados aún vivos (sin close())
+			let maxOpen = 0;
+			let cursor = 0;  // próximo índice por decodificar
+			const inflight = [];
+			// Errores diferidos: si un decode falla, se reporta al llegar a su índice
+			// (mismo resultado que Promise.all, pero sin unhandled rejections).
+			const decodeOne = async (idx) => {
+				try {
+					const item = sources[idx];
+					let bmp;
+					if (item instanceof Blob) {
+						bmp = await createImageBitmap(item);
+					} else {
+						const resp = await fetch(item);
+						bmp = await createImageBitmap(await resp.blob());
+					}
+					open++;
+					if (open > maxOpen) maxOpen = open;
+					bitmapFrLog('BitmapDecoded index=' + (idx + 1) + '/' + total + ' open=' + open);
+					return bmp;
+				} catch (err) {
+					return { __bitmapError: err };
+				}
+			};
+			const fill = () => {
+				while (open + inflight.length < BITMAP_WINDOW && cursor < total) {
+					inflight.push(decodeOne(cursor++));
+				}
+			};
+			for (let i = 0; i < total; i++) {
+				fill();
+				const bmp = await inflight.shift();
+				if (bmp && bmp.__bitmapError) throw bmp.__bitmapError;
+				await onItem(bmp, i);
+				bitmapFrLog('BitmapDrawn index=' + (i + 1) + '/' + total);
+				try { bmp.close(); } catch (e) {}
+				open--;
+				bitmapFrLog('BitmapClosed index=' + (i + 1) + ' open=' + open + ' max=' + maxOpen);
+			}
+			bitmapFrLog('MaxBitmapsOpen=' + maxOpen);
+			return maxOpen;
+		}
 
 		let capturex_setChildScrollableHeight = 0;
 		let capturex_fullpage = 0;
@@ -520,12 +829,15 @@
 				else
 					return false;
 			},
-			getVisibleBoundingRect: function (element) {
+			_visibleRectComputeUncached: function (element) {
 				let rect = element.getBoundingClientRect();
 				let ancestor = element.parentElement;
+				// PERF-07: profundidad acotada y rects de ancestros desde la caché de bbox.
+				let depth = 0;
 
-				while (ancestor) {
-					const ancestorRect = ancestor.getBoundingClientRect();
+				while (ancestor && depth < 15) {
+					depth++;
+					const ancestorRect = _getCachedRect(ancestor);
 					rect = {
 						top: Math.max(rect.top, ancestorRect.top),
 						left: Math.max(rect.left, ancestorRect.left),
@@ -541,6 +853,14 @@
 					ancestor = ancestor.parentElement;
 				}
 				return rect;
+			},
+			// PERF-07: wrapper con caché (WeakMap; se invalida con _clearBBoxCache).
+			getVisibleBoundingRect: function (element) {
+				if (_visibleRectCache.has(element)) return _visibleRectCache.get(element);
+				const result = capturex_com_tools._visibleRectComputeUncached(element);
+				_visibleRectCache.set(element, result);
+				try { console.log('[FEATURE_RUNTIME]', 'VisibleRect height=' + Math.round(result.bottom - result.top) + ' top=' + Math.round(result.top) + ' bottom=' + Math.round(result.bottom)); } catch (e) {}
+				return result;
 			},
 			iframeIsSameOrigin: function (iframe) {
 				const currentOrigin = window.location.origin;
@@ -617,118 +937,6 @@
 					scrollbarWidth = 0;
 				return scrollbarWidth;
 			},
-			dom: function (obj) {
-				if (!obj.hasChildNodes) {
-					return;
-				}
-				var nodes = obj.childNodes;
-				for (var i = 0; i < nodes.length; i++) {
-					var curNode = nodes[i];
-					var attrs = curNode.attributes;
-					if (curNode.nodeName.toLowerCase() == "script"
-						|| curNode.nodeName.toLowerCase() == "iframe"
-						|| curNode.nodeName.toLowerCase() == "link"
-						|| curNode.nodeName.toLowerCase() == "meta"
-						|| !this.isVisibleNode(curNode)) {
-						curNode.parentNode.removeChild(curNode)
-					} else if (curNode.nodeName.toLowerCase() == "a"
-						|| curNode.nodeName.toLowerCase() == "img"
-						|| curNode.nodeName.toLowerCase() == "embed") {
-						if (attrs != null) {
-							for (var j = 0; j < attrs.length; j++) {
-								var a = attrs[j].nodeName.toLowerCase();
-								var v = attrs[j].nodeValue;
-								if (a == "href" || a == "src") {
-									if (v.toLowerCase().indexOf("javascript:") == 0
-										|| v.indexOf("#") == 0) {
-										attrs[j].nodeValue = "";
-									} else {
-										v = this.replaceURL(v);
-										attrs[j].nodeValue = v;
-									}
-								}
-							}
-						}
-					}
-					if (curNode != null && curNode.hasChildNodes) {
-						this.dom(curNode);
-					}
-				}
-			},
-			replaceURL: function (url) {
-				if (!window.location) {
-					return url;
-				}
-				var match = null;
-				url = this.trim(url);
-				var host = window.location.host;
-				var proto = window.location.protocol;
-				var base = window.location.href.split("?")[0].split('#')[0];
-				base = base.substr(0, base.lastIndexOf('/')) + "/";
-				var rbase = proto + "//" + host;
-				if ((match = url.match(/^(https?):/i)) != null) {
-					return url;
-				} else {
-					if (url.indexOf("/") == 0) {
-						return rbase + url;
-					} else {
-						return base + url;
-					}
-				}
-			},
-			trim: function (str) {
-				if (typeof str != "string") {
-					return str;
-				} else {
-					return str.replace(/^\s+/, '').replace(/\s+$/, '');
-				}
-			},
-			isBrowser: function () {
-				if (navigator.appVersion.indexOf("MSIE", 0) != -1)
-					return 'IE';
-				if (navigator.appVersion.indexOf("WebKit", 0) != -1)
-					return 'Safari';
-				if (navigator.userAgent.indexOf("Firefox", 0) != -1)
-					return 'Firefox';
-				if (navigator.userAgent.indexOf("WebKit") > 0
-					&& navigator.userAgent.indexOf("iPad") > 0)
-					return 'Ipad';
-				if (navigator.userAgent.indexOf("WebKit") > 0
-					&& navigator.userAgent.indexOf("iPhone") > 0)
-					return 'Iphone';
-				if (navigator.userAgent.indexOf("WebKit") > 0
-					&& navigator.userAgent.indexOf("Chrome") > 0)
-					return 'Chrome';
-			},
-			isVisibleNode: function (node) {
-				if (node.nodeType) {
-					if (node.nodeType == 3) {
-						return true;
-					}
-					if (this.isBrowser() == 'IE') {
-						if (node.currentStyle != null
-							&& node.currentStyle['display'] == "none") {
-							return false;
-						}
-					} else {
-						try {
-							if (window.getComputedStyle(node, null)['display'] == "none") {
-								return false;
-							}
-						} catch (e) {
-							return false;
-						}
-					}
-					return true;
-				} else {
-					return false;
-				}
-			},
-			scrollToHeight: function (height) {
-				window.scrollTo({
-					top: height
-				});
-			},
 			withoutInlineStyleImportant: function (element) {
 				const inlineStyle = element.style.cssText;
 				if (inlineStyle.includes('opacity') && inlineStyle.includes('!important')) {
@@ -761,7 +969,10 @@
 						}
 					});
 
-					const timeoutId = setTimeout(() => {
+					const timeoutId =					// PERF-09: ventana del transform 80 → 40 ms (el observer de crecimiento
+					// y los reflows del sitio son la señal real, no el sleep fijo).
+					setTimeout(() => {
+						try { console.log('[FEATURE_RUNTIME]', 'ScrollTransformWait ms=40'); } catch (e) {}
 						cleanup();
 						resolve(checkContentGrowth());
 					}, timeout);
@@ -787,25 +998,7 @@
 				const elementAtPoint = document.elementFromPoint(centerX, centerY);
 				return elementAtPoint !== el && !el.contains(elementAtPoint);
 			},
-			pauseAllAnimations: function () {
-				const all = document.querySelectorAll('*');
-				for (let i = 0, len = all.length; i < len; i++) {
-					const el = all[i];
-					const cs = window.getComputedStyle(el);
-					if (cs.animationName !== 'none' || cs.transitionProperty !== 'none') {
-						el.style.animationPlayState = 'paused';
-						el.style.transition = 'none';
-					}
-				}
-			},
-			resumeAllAnimations: function () {
-				const all = document.querySelectorAll('[style*="animation-play-state"], [style*="transition"]');
-				for (let i = 0, len = all.length; i < len; i++) {
-					const el = all[i];
-					el.style.animationPlayState = '';
-					el.style.transition = '';
-				}
-			},
+
 			copyImageToClipboard: async function (imageData, mimeType = 'image/png') {
 				try {
 					if (!navigator.clipboard) {
@@ -879,15 +1072,20 @@
 				capturex_onePageHeight = 0;
 				capturex_onePageOverlap = 0;
 				capturex_contentPageCrollTop = 0;
+				// PERF-05: invalida el walk único y la caché de rects (la página pudo cambiar).
+				capturex_com_saveAction._preScanInvalidate();
+				try { _clearBBoxCache(); } catch (e) {}
 				capturex_nowRealPageCrollTop = 0;
 				capturex_preRealPageCrollTop = 0;
 				capturex_scrollbarWidth = 0;
 				capturex_changStyleForShotTimes = 0;
+				_resetFallbackClassification();
 				capturex_capture_truncated = false;
 				capturex_snap_mergedImage_array = [];
 				capturex_snap_mergedImage_index = 0;
 				_clearBBoxCache();
 				capturex_capturedScrollTops = new Set();
+				capturex_capturedRealTops = [];
 				capturex_capture_top = undefined;
 				capturex_capture_bottom = undefined;
 				capturex_capture_left = undefined;
@@ -897,7 +1095,6 @@
 				capturex_capture_array_height = [];
 				capturex_capture_array_splicing_index = 0;
 				capturex_overScrollTop = 0;
-				elementAbsolutePositions = new WeakMap(); // Reset to new WeakMap to release references
 				capture_working = 0;
 				capturex_scrollableEles = [];
 				capturex_setChildScrollableHeight = 0;
@@ -1413,56 +1610,143 @@
 
 				return newDocHeight;
 			},
-			getMaxHeight: function (element, currentDepth, maxDepth) {
-				if (currentDepth > maxDepth) {
-					return 0;
+			// ===== PERF-05 (auditoría _002): un solo recorrido DOM pre-captura =====
+			// preScanDocument hace UN walk DFS que recolecta: candidatos scrollables
+			// (pre-filtro barato sin getComputedStyle), todos los iframes/frames y el
+			// snapshot de candidatos de contenido (childElementCount/textContent —
+			// cero innerHTML). Consumidores: findScrollableElements, el loop de
+			// iframes de captureAllPageScreenshot y applyPreScanContentRules.
+			_preScanCache: null,
+			_preScanInvalidate: function () {
+				this._preScanCache = null;
+			},
+			preScanDocument: function () {
+				if (this._preScanCache) {
+					try { console.log('[FEATURE_RUNTIME]', 'PreScanCacheUsed'); } catch (e) {}
+					return this._preScanCache;
 				}
-
-				const rect = element.getBoundingClientRect();
-				const width = rect.width;
-
-				let maxHeight = element.scrollHeight;
-				if ((element.tagName == 'IFRAME' || element.tagName == 'FRAME') && capturex_com_tools.iframeIsSameOrigin(element)) {
-					const iframeDocument = element.contentDocument || element.contentWindow.document;
-					maxHeight = iframeDocument.body.scrollHeight;
-				}
-
-				let computedStyle = window.getComputedStyle(element);
-
-				if (element.tagName == 'IFRAME' && width > capturex_documentWdith - 100 && rect.top < window.innerHeight / 2 && maxHeight > capturex_documentHeight / 2) {
-					if (element.src && element.src.indexOf('http') == 0 && !capturex_com_tools.iframeIsSameOrigin(element)) {
-						capturex_contentEleIframe = element;
+				const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+				const acc = { nodes: 0, maxScroll: 0, scrollableRaw: [], frames: [], contentCandidates: [] };
+				const walk = function (element, depth) {
+					acc.nodes++;
+					const tag = element.tagName;
+					if (depth <= 20) {
+						// Equivalente al valor de retorno del getMaxHeight original:
+						// max scrollHeight del subárbol del body con profundidad <= 20.
+						// En frames same-origin el internal document reemplaza la medida
+						// (igual que hacía la línea maxHeight = iframeDocument...).
+						let sh = element.scrollHeight;
+						if (tag == 'IFRAME' || tag == 'FRAME') {
+							try {
+								if (capturex_com_tools.iframeIsSameOrigin(element)) {
+									const fd = element.contentDocument || (element.contentWindow && element.contentWindow.document);
+									if (fd && fd.body) sh = fd.body.scrollHeight;
+								}
+							} catch (e) {}
+						}
+						if (sh > acc.maxScroll) acc.maxScroll = sh;
 					}
-				}
-
-				if (computedStyle.overflowY == 'scroll' || computedStyle.overflowY == 'auto') {
-					if ((element.innerHTML.length > 100 || element.innerHTML.includes('<img')) && rect.top < window.innerHeight / 2 && element.tagName != 'BODY' && maxHeight > capturex_documentHeight && (width > 500 || width > capturex_documentWdith / 2)) {
-						if (element.scrollHeight > element.clientHeight) {
-							capturex_documentHeight = maxHeight;
+					if (tag != 'BODY' && tag != 'HTML') {
+						if (tag == 'IFRAME' || tag == 'FRAME') {
+							// Los frames siempre entran: isVerticallyScrollableFrame los
+							// evalúa por documento interno (el pre-filtro no aplica).
+							acc.frames.push(element);
+							acc.scrollableRaw.push(element);
+						}
+						else if (element.scrollHeight > element.clientHeight + 2 || element.scrollWidth > element.clientWidth + 2) {
+							// Mismo umbral que el primer chequeo de isVerticallyScrollable
+							// (más contrapartida horizontal para no perder scrollables en X
+							// frente al walk completo histórico de ScrollFinder — PERF-06b;
+							// el loop legacy sigue filtrando en vertical, sin cambios).
+							acc.scrollableRaw.push(element);
+						}
+						if (depth <= 20) {
+							// Snapshot de contenido SIN innerHTML (PERF-05/QW-06):
+							// childElementCount/textContent no serializan el subárbol.
+							let contentOK = element.childElementCount > 0;
+							if (!contentOK) {
+								try { contentOK = (element.textContent || '').length > 100; } catch (e) { contentOK = false; }
+							}
+							acc.contentCandidates.push({ el: element, contentOK: contentOK });
+						}
+					}
+					const children = element.children;
+					for (let i = 0; i < children.length; i++) walk(children[i], depth + 1);
+				};
+				if (document.body) walk(document.body, 0);
+				this._preScanCache = acc;
+				const ms = Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0);
+				try { console.log('[FEATURE_RUNTIME]', 'PreScanWalk nodes=' + acc.nodes + ' scrollableCandidates=' + acc.scrollableRaw.length + ' framesDetected=' + acc.frames.length + ' contentCandidates=' + acc.contentCandidates.length + ' ms=' + ms); } catch (e) {}
+				return acc;
+			},
+			// Reglas de selección de contenido (antes getMaxHeight) sobre el snapshot:
+			// mismas condiciones y mismo orden; devuelve el max scrollHeight (old _docHeight).
+			applyPreScanContentRules: function () {
+				const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+				const scan = this.preScanDocument();
+				const winHalf = window.innerHeight / 2;
+				const docW = capturex_documentWdith || document.documentElement.clientWidth;
+				const docUnscrollable = (document.documentElement.scrollHeight == document.documentElement.clientHeight);
+				for (let i = 0; i < scan.contentCandidates.length; i++) {
+					const item = scan.contentCandidates[i];
+					const element = item.el;
+					const tag = element.tagName;
+					const isFrame = (tag == 'IFRAME' || tag == 'FRAME');
+					if (isFrame) {
+						const rectF = _getCachedRect(element);
+						const widthF = rectF.width;
+						const sameOriginF = capturex_com_tools.iframeIsSameOrigin(element);
+						let ownMaxF = element.scrollHeight;
+						if (sameOriginF) {
+							try {
+								const fd = element.contentDocument || (element.contentWindow && element.contentWindow.document);
+								if (fd && fd.body) ownMaxF = fd.body.scrollHeight;
+							} catch (e) {}
+						}
+						// Regla capturex_contentEleIframe (iframe cross-origin grande): en el
+						// original corría para TODO iframe, sin condición de contenido.
+						if (tag == 'IFRAME' && widthF > docW - 100 && rectF.top < winHalf && ownMaxF > capturex_documentHeight / 2) {
+							const srcF = element.src || '';
+							if (srcF.indexOf('http') == 0 && !sameOriginF) capturex_contentEleIframe = element;
+						}
+						// Regla 3: mismo origen, documento interno más alto que el actual.
+						if (element.src && sameOriginF && ownMaxF > capturex_documentHeight && (widthF > 500 || widthF > docW / 2) && docUnscrollable) {
+							capturex_documentHeight = ownMaxF;
+							capturex_contentEle = element;
+						}
+						continue;
+					}
+					if (!item.contentOK) continue;
+					const rect = _getCachedRect(element);
+					if (!(rect.top < winHalf && rect.width > 0)) continue;
+					const width = rect.width;
+					const ownMax = element.scrollHeight;
+					const cs = window.getComputedStyle(element);
+					if (cs.overflowY == 'scroll' || cs.overflowY == 'auto') {
+						// Regla 1 (div scrollable con contenido). Nota: el reemplazo
+						// innerHTML→childElementCount/textContent prescrito por la auditoría
+						// es levemente más permisivo con nodos de markup mínimo; las demás
+						// condiciones (overflow, posición, ancho, scroll real) dominan.
+						if (rect.top < winHalf && ownMax > capturex_documentHeight && (width > 500 || width > docW / 2)) {
+							if (element.scrollHeight > element.clientHeight) {
+								capturex_documentHeight = ownMax;
+								capturex_contentEle = element;
+							}
+						}
+					}
+					else if (cs.transform && cs.transform != 'none' && capturex_documentHeight < window.innerHeight * 1.5) {
+						// Regla 2 (transform): se preserva VERBATIM la condición original
+						// element.parentElement.transform (propiedad inexistente → siempre
+						// falsa) para no alterar el comportamiento histórico.
+						if (element.parentElement.transform == 'none' && rect.top < winHalf && ownMax > capturex_documentHeight && (width > 500 || width > docW / 2)) {
+							capturex_documentHeight = ownMax;
 							capturex_contentEle = element;
 						}
 					}
 				}
-				else if (computedStyle.transform && computedStyle.transform != 'none' && capturex_documentHeight < window.innerHeight * 1.5) {
-					if (element.parentElement.transform == 'none' && (element.innerHTML.length > 100 || element.innerHTML.includes('<img')) && rect.top < window.innerHeight / 2 && element.tagName != 'BODY' && maxHeight > capturex_documentHeight && (width > 500 || width > capturex_documentWdith / 2)) {
-						capturex_documentHeight = maxHeight;
-						capturex_contentEle = element;
-					}
-				}
-				else if (element.tagName == 'IFRAME' || element.tagName == 'FRAME') {
-					if (element.src && capturex_com_tools.iframeIsSameOrigin(element) && maxHeight > capturex_documentHeight && (width > 500 || width > capturex_documentWdith / 2)) {
-						if (document.documentElement.scrollHeight == document.documentElement.clientHeight) {
-							capturex_documentHeight = maxHeight;
-							capturex_contentEle = element;
-						}
-					}
-				}
-
-				for (let i = 0; i < element.children.length; i++) {
-					let child = element.children[i];
-					maxHeight = Math.max(maxHeight, capturex_com_saveAction.getMaxHeight(child, currentDepth + 1, maxDepth));
-				}
-				return maxHeight;
+				const ms = Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0);
+				try { console.log('[FEATURE_RUNTIME]', 'MaxHeightScan nodes=' + scan.contentCandidates.length + ' innerHtmlCalls=0 ms=' + ms); } catch (e) {}
+				return scan.maxScroll;
 			},
 			captureVisibleOnly: function () {
 				capturex_com_saveAction.reSetCaptureXData();
@@ -1472,9 +1756,8 @@
 				capturex_documentHeight_o = window.innerHeight;
 				capturex_onePageHeight = window.innerHeight;
 
-				setTimeout(function () {
-					chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: 0, y2: 0 });
-				}, 100); // Mismo prepareTime que en toda la pagina para estabilizar
+				setTimeout(function () {						chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: 0, y2: 0 });
+					}, 60); // PERF-09: 100 → 60 ms (rAF del SW ya estabiliza el frame)
 			},
 			captureAllPageScreenshot: function (nowTop = 0) {
 				// Detectar PDF: render full-page vía pdf.js (offscreen document)
@@ -1525,11 +1808,13 @@
 					}
 				}
 
-				const iframeElements = document.body.querySelectorAll('iframe, frame');
-				for (let i = 0; i < iframeElements.length; i++) {
-					const element = iframeElements[i];
-					let rect = element.getBoundingClientRect();
-					if (!capturex_com_tools.isElementOccluded(element) && rect.width > window.innerWidth * 0.7 && rect.height > window.innerHeight * 0.7 && !capturex_com_tools.iframeIsSameOrigin(element)) {
+				// PERF-05: iframes ya recolectados por el walk único (cero querySelectorAll).
+				const preScanFrames = capturex_com_saveAction.preScanDocument().frames;
+				try { console.log('[FEATURE_RUNTIME]', 'FrameScan merged=true candidates=' + preScanFrames.length); } catch (e) {}
+				for (let i = 0; i < preScanFrames.length; i++) {
+					const element = preScanFrames[i];
+					const rect = _getCachedRect(element);
+					if (rect.width > window.innerWidth * 0.7 && rect.height > window.innerHeight * 0.7 && !capturex_com_tools.iframeIsSameOrigin(element) && !capturex_com_tools.isElementOccluded(element)) {
 						capturex_com_saveAction.captureSelectAllPageScreenshot(null, 1);
 						return;
 					}
@@ -1566,17 +1851,15 @@
 					capturex_documentHeight_o = capturex_documentHeight;
 					capturex_onePageHeight = window.innerHeight;
 
-					var prepareTime = 150;
-					if (!scrollableElements || scrollableElements.length == 0)
-						prepareTime = 30;
-
+					// PERF-09: un solo timer de preparación (60/0 ms, antes 150/30 + dos
+					// setTimeout anidados de 10 ms). La estabilidad real la dan los rAF
+					// de sqaAfterFrameStable dentro de captureVisiblePageScreenshot.
+					const prepareTime = (scrollableElements && scrollableElements.length > 0) ? 60 : 0;
+					try { console.log('[FEATURE_RUNTIME]', 'PrepDelay ms=' + prepareTime + ' scrollables=' + ((scrollableElements && scrollableElements.length) || 0)); } catch (e) {}
 					setTimeout(function () {
 						if (top == 0) window.scrollTo({ top: 0 });
 						if (capturex_setChildScrollableHeight == 1) capturex_com_saveAction.changStyleForFullShot(document.body);
 						capturex_com_saveAction.changStyleForShot();
-					}, 10);
-
-					setTimeout(function () {
 						capturex_com_saveAction.captureVisiblePageScreenshot(capturex_documentHeight, top, capturex_onePageHeight, 0, 0);
 					}, prepareTime);
 				}
@@ -1633,7 +1916,9 @@
 				else {
 					capturex_documentHeight = docHeight;
 
-					var _docHeight = capturex_com_saveAction.getMaxHeight(document.body, 0, 20);
+					// PERF-05: reglas de contenido sobre el snapshot del walk único
+					// (un solo recorrido DOM; cero innerHTML).
+					var _docHeight = capturex_com_saveAction.applyPreScanContentRules();
 					if (capturex_contentEleIframe) {
 						capture_working = 0;
 						alert('No se pueden capturar iframes de diferente origen');
@@ -1762,7 +2047,7 @@
 					}
 				}
 
-				afterFrameStable(function () {
+				sqaAfterFrameStable(function () {
 					if (nowTop > 0 && capturex_contentEle) {
 						var fistTop = capturex_scrollPosition + capturex_overScrollTop;
 						capturex_com_saveAction.captureVisiblePageScreenshot(capturex_documentHeight, fistTop, capturex_onePageHeight, 0, 0);
@@ -1771,7 +2056,7 @@
 						capturex_com_saveAction.captureVisiblePageScreenshot(capturex_documentHeight, 0, capturex_onePageHeight, 0, 0);
 				});
 			},
-			simulateScroll: function (deltaY, element, scrollTop) {
+				simulateScroll: function (deltaY, element, scrollTop) {
 				const _o_style = window.getComputedStyle(capturex_contentEle);
 				const transform_o = _o_style.transform;
 
@@ -1828,10 +2113,16 @@
 				}
 			},
 			scrollTopForCapture: function (scrollTop) {
+				// STITCH_DUPLICATED_VIEWPORT_REGRESSION_001 (H1): forzar scroll INSTANT.
+				// window.scrollTo({top}) respeta el CSS scroll-behavior:smooth del sitio
+				// (AvalPay) y anima ~300-500ms: la captura salia con el frame anterior.
+				// behavior:'instant' + asignacion directa = doble garantia, sin sleeps.
 				if (capturex_contentEle) {
 					if (capturex_contentEle.tagName == 'IFRAME' || capturex_contentEle.tagName == 'FRAME') {
 						const iframeWindow = capturex_contentEle.contentWindow;
-						iframeWindow.scrollTo(0, scrollTop);
+						try { iframeWindow.scrollTo({ top: scrollTop, left: 0, behavior: 'instant' }); } catch (e) { try { iframeWindow.scrollTo(0, scrollTop); } catch (e2) {} }
+						try { iframeWindow.document.documentElement.scrollTop = scrollTop; } catch (e) {}
+						try { iframeWindow.document.body.scrollTop = scrollTop; } catch (e) {}
 					}
 					else {
 						if (capturex_contentEle.style.transform) {
@@ -1847,13 +2138,18 @@
 						document.body.scrollTop = scrollTop;
 					}
 					else {
-						window.scrollTo({ top: scrollTop });
+						try { window.scrollTo({ top: scrollTop, left: 0, behavior: 'instant' }); } catch (e) { try { window.scrollTo({ top: scrollTop, left: 0, behavior: 'auto' }); } catch (e2) { window.scrollTo(0, scrollTop); } }
+						try { document.documentElement.scrollTop = scrollTop; } catch (e) {}
+						try { document.body.scrollTop = scrollTop; } catch (e) {}
 					}
 				}
 			},
 			captureVisiblePageScreenshot: function (docHeight, scrollTop, windowInnerHeight, _y1, _y2) {
-				// Skip if already captured at this scroll position
-				if (capturex_capturedScrollTops && capturex_capturedScrollTops.has(scrollTop)) return;
+				// STITCH_DUPLICATED_VIEWPORT_REGRESSION_001: instrumentación por viewport
+				const vpIndex0 = capturex_capture_array.length;
+				try { console.log('[FEATURE_RUNTIME]', 'ViewportTarget index=' + vpIndex0 + ' targetY=' + scrollTop + ' docHeight=' + docHeight); } catch (e) {}
+			// Skip if already captured at this scroll position
+			if (capturex_capturedScrollTops && capturex_capturedScrollTops.has(scrollTop)) { try { console.log('[FEATURE_RUNTIME]', 'ViewportSkippedRepeatTarget index=' + vpIndex0 + ' targetY=' + scrollTop); } catch (e) {} return; }
 				if (capturex_capturedScrollTops) capturex_capturedScrollTops.add(scrollTop);
 
 				capturex_contentPageCrollTop = scrollTop;
@@ -1863,22 +2159,10 @@
 
 				function waitForFrame(cb) { requestAnimationFrame(function(){ setTimeout(cb, 0); }); }
 
-				// PERF_CAPTURE_FULL_001 D1: 2 rAF + scroll estable (máx 3 frames) en vez de
-				// sleeps fijos de 40-80 ms por viewport. Conserva el orden; el cuerpo del
-				// llamador se evalúa al disparar, igual que con setTimeout.
-				function afterFrameStable(fn) {
-					let frames = 0;
-					let lastTop = capturex_com_saveAction.getPageScrollTop();
-					function tick() {
-						frames++;
-						const top = capturex_com_saveAction.getPageScrollTop();
-						if ((top === lastTop && frames >= 2) || frames >= 3) { fn(); return; }
-						lastTop = top;
-						requestAnimationFrame(function(){ setTimeout(tick, 0); });
-					}
-					requestAnimationFrame(function(){ setTimeout(tick, 0); });
-				}
-
+				// PERF_CAPTURE_FULL_001 D1 + PERF-09 + STITCH_DUPLICATED_VIEWPORT_REGRESSION_001:
+				// la estabilización (sqaAfterFrameStable) y la verificación post-scroll
+				// (sqaAfterScrollApplied) viven a nivel de módulo; la copia local que estaba
+				// aquí dejaba a captureSelectAllPageScreenshot con una referencia huérfana.
 				function afterScroll() {
 					capturex_com_saveAction.changStyleForShot(capturex_contentEle);
 					capturex_nowRealPageCrollTop = capturex_com_saveAction.getPageScrollTop();
@@ -1909,27 +2193,31 @@
 
 					let pageClientHeight = capturex_com_saveAction.getPageClientHeight();
 					if (capture_working == 0) {
-						afterFrameStable(function () {
+						sqaAfterFrameStable(function () {
 							var y1 = 0, y2 = 0;
 							if (scrollTop > 0) {
 								y1 = capturex_onePageHeight - (capturex_nowRealPageCrollTop - capturex_preRealPageCrollTop) - Math.floor(capturex_onePageOverlap / 2);
 								y2 = capturex_onePageHeight;
 							}
-							chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: y1, y2: y2 });
+							sqaAfterScrollApplied(scrollTop, vpIndex0, function () {
+								chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: y1, y2: y2 });
+							});
 						});
 					}
 					else if ((scrollTop + pageClientHeight) < docHeight && scrollTop < capturex_capture_max_height) {
 						var nextScrollTop = scrollTop + capturex_onePageHeight - capturex_onePageOverlap;
 						var nextPageData = { docHeight: docHeight, nextScrollTop: nextScrollTop, windowInnerHeight: capturex_onePageHeight, y1: 0, y2: 0 };
-						afterFrameStable(function () {
+						sqaAfterFrameStable(function () {
 							capturex_com_saveAction.scrollTopForCapture(scrollTop);
-							chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: _y1, y2: _y2, nextPageData: nextPageData });
+							sqaAfterScrollApplied(scrollTop, vpIndex0, function () {
+								chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: _y1, y2: _y2, nextPageData: nextPageData });
+							});
 						});
 					}
 					else {
-						afterFrameStable(function () {
+						sqaAfterFrameStable(function () {
 							capturex_com_saveAction.scrollTopForCapture(scrollTop);
-							afterFrameStable(function () {
+							sqaAfterFrameStable(function () {
 								let _newDocHeight = capturex_com_saveAction.getNewDocHeight();
 								if (_newDocHeight > docHeight) {
 									docHeight = _newDocHeight;
@@ -1938,7 +2226,9 @@
 								if ((scrollTop + pageClientHeight) < docHeight && scrollTop < capturex_capture_max_height) {
 									var nextScrollTop = scrollTop + capturex_onePageHeight - capturex_onePageOverlap;
 									var nextPageData = { docHeight: docHeight, nextScrollTop: nextScrollTop, windowInnerHeight: capturex_onePageHeight, y1: 0, y2: 0 };
-									chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: _y1, y2: _y2, nextPageData: nextPageData });
+									sqaAfterScrollApplied(scrollTop, vpIndex0, function () {
+										chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: _y1, y2: _y2, nextPageData: nextPageData });
+									});
 								}
 								else {
 									if ((scrollTop + pageClientHeight) < docHeight) capturex_capture_truncated = true;
@@ -1949,7 +2239,9 @@
 										y2 = capturex_onePageHeight;
 										if (y1 < 0) y1 = 0;
 									}
-									chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: y1, y2: y2 });
+									sqaAfterScrollApplied(scrollTop, vpIndex0, function () {
+										chrome.runtime.sendMessage({ action: "captureVisiblePageScreenshot", y1: y1, y2: y2 });
+									});
 								}
 							});
 						});
@@ -2021,10 +2313,15 @@
 				// SQA StylesManager: comprehensive fixed/sticky/transition handling
 				const SM = window.__sqaStylesManager;
 				if (SM) {
+					// PERF-01: primer viewport de la captura → estado limpio garantizado
+					// (protege contra capturas abortadas sin restoreAll).
+					if (capturex_changStyleForShotTimes === 0 && SM.beginCapture) SM.beginCapture();
 					SM.init();
 					const fullH = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight);
 					const fullW = Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement.scrollWidth);
 					SM.updateFixed(fullH, fullW, capturex_capture_array.length === 0);
+					// REGRESSION_001: trazabilidad del ajuste sticky por viewport
+					try { const _sc = (typeof SM._getClassificationCache === 'function') ? SM._getClassificationCache() : null; console.log('[FEATURE_RUNTIME]', 'StickyAdjustment index=' + capturex_capture_array.length + ' value=' + ((_sc && _sc.stickyElts) ? _sc.stickyElts.length : 'n/a')); } catch (e) {}
 					capturex_changStyleForShotTimes++;
 					return;
 				}
@@ -2081,14 +2378,14 @@
 					capturex_com_saveAction.setStyleForShot(contentElement, content_styleContent_class, content_styleContent);
 				}
 
-				let elements;
-				if (contentElement)
-					elements = contentElement.querySelectorAll(':not(style):not(script):not(meta):not(link):not(title):not(head)');
-				else
-					elements = document.querySelectorAll(':not(style):not(script):not(meta):not(link):not(title):not(head)');
+				// PERF-01 FASE 5: NADA de querySelectorAll(':not(...)') + getComputedStyle
+				// por viewport. La lista de candidatos (sticky/fixed/absolute) se clasifica
+				// UNA vez por captura y aquí solo se re-evalúa el estado ACTUAL de esos
+				// pocos candidatos (los ya procesados se saltan dentro de setStyleForShot).
+				const elements = _classifyOnceForFallback();
 
 				for (let i = 0, len = elements.length; i < len; i++) {
-					const element = elements[i];
+					const element = elements[i].el;
 					const elementStyle = window.getComputedStyle(element);
 					if (elementStyle.position === 'sticky') {
 						capturex_com_saveAction.setStyleForShot(element, sticky_styleContent_class, sticky_styleContent);
@@ -2130,6 +2427,8 @@
 				capturex_com_saveAction.scrollTopForCapture(capturex_scrollPosition);
 				capturex_changStyleForShotTimes = 0;
 				_clearBBoxCache();
+				// PERF-01 FASE 5: libera la clasificación única del fallback.
+				_resetFallbackClassification();
 				// SQA StylesManager: restore all overrides
 				const SM = window.__sqaStylesManager;
 				if (SM) {
@@ -2233,15 +2532,12 @@
 				if (totalHeight > capturex_canvas_browserMaxHeight) {
 					capturex_capture_truncated = true;
 					var _totalHeight = 0;
+					// PERF-06: prefijos acumulados (O(N) en vez de O(N²)).
+					const _prefixA = buildHeightPrefix(capturex_capture_array_height);
 					for (let i = 0; i < capturex_capture_array.length; i++) {
-						let dtotalHeight = 0, dheight = 0;
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							for (let j = 0; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
-							}
-						}
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0)
-							dtotalHeight = dheight + capturex_capture_array_height[i];
+						let dtotalHeight = 0;
+						if (_prefixA)
+							dtotalHeight = _prefixA[i] + capturex_capture_array_height[i];
 						else
 							dtotalHeight = (i + 1) * height;
 						if (dtotalHeight > capturex_canvas_browserMaxHeight)
@@ -2335,49 +2631,35 @@
 					});
 				}
 
-				const loadBitmap = async (src) => {
-					if (src instanceof Blob) return createImageBitmap(src);
-					const resp = await fetch(src);
-					const blob = await resp.blob();
-					return createImageBitmap(blob);
-				};
+				// PERF-02/MEM-01: Bitmap Streaming — antes `Promise.all` decodificaba TODOS
+				// los cortes a la vez (≈18 MB/página a DPR 2 → pico >500 MB en 30 páginas).
+				// Ahora una ventana deslizante mantiene ≤4 bitmaps vivos, dibuja en orden
+				// y hace close() inmediato tras drawImage(). Resultado visual idéntico.
 				const endIdx = Math.min(end_index, capturex_capture_array.length - 1);
-				const items = new Array(endIdx + 1);
-				for (let k = 0; k <= endIdx; k++) items[k] = capturex_capture_array[k];
-				const loaded = await Promise.all(items.map(item => loadBitmap(item)));
-				// Micro‑batch: yield every 4 frames to keep UI responsive
-				const BATCH = 4;
-				for (let i = 0; i <= endIdx; i++) {
-					capturex_capture_array_splicing_index = i;
-					const image = loaded[i];
-					if (i == (capturex_capture_array.length - 1) && y1 > 0 && y2 > 0) {
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							let dheight = 0;
-							for (let j = 0; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
+				const sources = new Array(endIdx + 1);
+				for (let k = 0; k <= endIdx; k++) sources[k] = capturex_capture_array[k];					// PERF-06: prefijos acumulados (O(N) en vez de O(N²) por página).
+					const _prefixC = buildHeightPrefix(capturex_capture_array_height);
+					await decodeBitmapStreaming(sources, async (image, i) => {
+						capturex_capture_array_splicing_index = i;
+						if (i == (capturex_capture_array.length - 1) && y1 > 0 && y2 > 0) {
+							if (_prefixC) {
+								context.drawImage(image, 0, n_y, width, capturex_capture_array_height[i] - n_y, 0 + left_image_width, _prefixC[i] + top_image_height + HEADER_HEIGHT, width, capturex_capture_array_height[i] - n_y);
+								try { console.log('[FEATURE_RUNTIME]', 'StitchDraw index=' + i + ' drawY=' + Math.round(_prefixC[i] + top_image_height + HEADER_HEIGHT) + ' h=' + Math.round(capturex_capture_array_height[i] - n_y) + ' mode=last-ny'); } catch (e) {}
 							}
-							context.drawImage(image, 0, n_y, width, capturex_capture_array_height[i] - n_y, 0 + left_image_width, dheight + top_image_height + HEADER_HEIGHT, width, capturex_capture_array_height[i] - n_y);
+							else {
+								context.drawImage(image, 0, n_y, width, height - n_y, 0 + left_image_width, height * i + top_image_height + HEADER_HEIGHT, width, height - n_y);
+							}
 						}
 						else {
-							context.drawImage(image, 0, n_y, width, height - n_y, 0 + left_image_width, height * i + top_image_height + HEADER_HEIGHT, width, height - n_y);
-						}
-					}
-					else {
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							let dheight = 0;
-							for (let j = 0; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
+							if (_prefixC) {
+								context.drawImage(image, 0 + left_image_width, _prefixC[i] + top_image_height + HEADER_HEIGHT, width, capturex_capture_array_height[i]);
+								try { console.log('[FEATURE_RUNTIME]', 'StitchDraw index=' + i + ' drawY=' + Math.round(_prefixC[i] + top_image_height + HEADER_HEIGHT) + ' h=' + Math.round(capturex_capture_array_height[i])); } catch (e) {}
 							}
-							context.drawImage(image, 0 + left_image_width, dheight + top_image_height + HEADER_HEIGHT, width, capturex_capture_array_height[i]);
-						}
 						else {
 							context.drawImage(image, 0 + left_image_width, i * height + top_image_height + HEADER_HEIGHT, width, height);
 						}
 					}
-					image.close();
-					if ((i + 1) % BATCH === 0 && i < endIdx)
-						await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
-				}
+				});
 				if (capturex_capture_bottom && capturex_capture_array_splicing_index == (capturex_capture_array.length - 1)) {
 					const image = new Image();
 					const objectUrlBottom = capturex_capture_bottom instanceof Blob ? URL.createObjectURL(capturex_capture_bottom) : capturex_capture_bottom;
@@ -2429,22 +2711,16 @@
 				if (totalHeight > capturex_canvas_browserMaxHeight) {
 					capturex_capture_truncated = true;
 					var _totalHeight = 0;
+					// PERF-06: prefijos acumulados relativos a start_index (O(N) en vez de O(N²)).
+					const _hB = capturex_capture_array_height;
+					const _prefixB = (_hB && _hB.length > 0 && start_index < _hB.length)
+						? buildHeightPrefix(_hB.slice(start_index)) : null;
 					for (let i = start_index; i < capturex_capture_array.length; i++) {
-
 						let dtotalHeight = 0;
-						let dheight = 0;
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							for (let j = start_index; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
-							}
-						}
-
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							dtotalHeight = dheight + capturex_capture_array_height[i];
-						}
-						else {
+						if (_prefixB)
+							dtotalHeight = _prefixB[i - start_index] + capturex_capture_array_height[i];
+						else
 							dtotalHeight = (i - start_index + 1) * height;
-						}
 
 						if (dtotalHeight > capturex_canvas_browserMaxHeight) {
 							break;
@@ -2479,46 +2755,37 @@
 				context.fillStyle = bgColor;
 				context.fillRect(0, 0, canvas.width, canvas.height);
 
+				// PERF-02/MEM-01: mismo streaming con ventana deslizante (≤4 bitmaps vivos,
+				// close() inmediato tras cada drawImage).
 				const endIdx2 = Math.min(end_index, capturex_capture_array.length - 1);
-				const items2 = new Array(endIdx2 - start_index + 1);
-				for (let k = start_index; k <= endIdx2; k++) items2[k - start_index] = capturex_capture_array[k];
-				const loaded2 = await Promise.all(items2.map(item => {
-					if (item instanceof Blob) return createImageBitmap(item);
-					return fetch(item).then(r => r.blob()).then(b => createImageBitmap(b));
-				}));
-				const BATCH2 = 4;
-				for (let i = start_index; i <= endIdx2; i++) {
+				const sources2 = new Array(endIdx2 - start_index + 1);
+				for (let k = start_index; k <= endIdx2; k++) sources2[k - start_index] = capturex_capture_array[k];
+				// PERF-06: prefijos acumulados relativos a start_index (O(N) en vez de O(N²)).
+				const _hD = capturex_capture_array_height;
+				const _prefixD = (_hD && _hD.length > 0 && start_index < _hD.length)
+					? buildHeightPrefix(_hD.slice(start_index)) : null;
+				await decodeBitmapStreaming(sources2, async (image, idx) => {
+					const i = start_index + idx;
 					capturex_capture_array_splicing_index = i;
-					const image = loaded2[i - start_index];
 					if (i == (capturex_capture_array.length - 1) && y1 > 0 && y2 > 0) {
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							let dheight = 0;
-							for (let j = start_index; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
-							}
-
-							context.drawImage(image, 0, n_y, width, capturex_capture_array_height[i] - n_y, 0 + left_image_width, dheight, width, capturex_capture_array_height[i] - n_y);
+						if (_prefixD) {
+							context.drawImage(image, 0, n_y, width, capturex_capture_array_height[i] - n_y, 0 + left_image_width, _prefixD[idx], width, capturex_capture_array_height[i] - n_y);
+							try { console.log('[FEATURE_RUNTIME]', 'StitchDraw index=' + i + ' drawY=' + Math.round(_prefixD[idx]) + ' h=' + Math.round(capturex_capture_array_height[i] - n_y) + ' mode=last-ny'); } catch (e) {}
 						}
 						else {
 							context.drawImage(image, 0, n_y, width, height - n_y, 0 + left_image_width, height * (i - start_index), width, height - n_y);
 						}
 					}
 					else {
-						if (capturex_capture_array_height && capturex_capture_array_height.length > 0) {
-							let dheight = 0;
-							for (let j = start_index; j < i; j++) {
-								dheight += capturex_capture_array_height[j];
-							}
-							context.drawImage(image, 0 + left_image_width, dheight, width, capturex_capture_array_height[i]);
+						if (_prefixD) {
+							context.drawImage(image, 0 + left_image_width, _prefixD[idx], width, capturex_capture_array_height[i]);
+							try { console.log('[FEATURE_RUNTIME]', 'StitchDraw index=' + i + ' drawY=' + Math.round(_prefixD[idx]) + ' h=' + Math.round(capturex_capture_array_height[i])); } catch (e) {}
 						}
 						else {
 							context.drawImage(image, 0 + left_image_width, (i - start_index) * height, width, height + 1);
 						}
 					}
-					image.close();
-					if ((i - start_index + 1) % BATCH2 === 0 && i < endIdx2)
-						await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
-				}
+				});
 
 				if (capturex_capture_bottom && capturex_capture_array_splicing_index == (capturex_capture_array.length - 1)) {
 					const image = new Image();
@@ -2547,17 +2814,28 @@
 					for (let k = 0; k < capturex_snap_mergedImage_array.length; k++) {
 						const blob = capturex_snap_mergedImage_array[k];
 						if (blob) {
-							const reader = new FileReader();
-							// PERF_CAPTURE_FULL_D2_EVALUATION: mide FileReader (se publica vía convMs).
-							const frT02 = Date.now();
-							const frBytes2 = (blob && blob.size) || 0;
-							reader.onloadend = function () {
-								// AUDIT_EXTWEB_REAL_PERF_001: stitchMs lo mide el SW (ver handler).
-								var stitchMs = null;
-								try { stitchMs = window.__sqaPerfStitchStart ? (Date.now() - window.__sqaPerfStitchStart) : null; } catch (e) {}
-								chrome.runtime.sendMessage({ action: 'processFinalImageBlob', imageBlob: reader.result, browserName: _lastBrowserInfo.browserName, browserVersion: _lastBrowserInfo.fullVersion, os: _lastOS, stitchMs: stitchMs, convMs: Date.now() - frT02, convBytes: frBytes2, convOut: (reader.result && reader.result.length) || 0 });
-							};
-							reader.readAsDataURL(blob);
+							// PERF-03: canal binario (chunks 1.5MB con ack) — cero FileReader/base64.
+							var stitchMs2 = null;
+							try { stitchMs2 = window.__sqaPerfStitchStart ? (Date.now() - window.__sqaPerfStitchStart) : null; } catch (e) {}
+							sendFinalBlobBinary(blob, {
+								browserName: _lastBrowserInfo.browserName,
+								browserVersion: _lastBrowserInfo.fullVersion,
+								os: _lastOS,
+								stitchMs: stitchMs2
+							}, function () {
+								// Fallback legacy: FileReader → dataURL (+33% wire), ruta sin opt-in.
+								const reader = new FileReader();
+								// PERF_CAPTURE_FULL_D2_EVALUATION: mide FileReader (se publica vía convMs).
+								const frT02 = Date.now();
+								const frBytes2 = (blob && blob.size) || 0;
+								reader.onloadend = function () {
+									// AUDIT_EXTWEB_REAL_PERF_001: stitchMs lo mide el SW (ver handler).
+									var stitchMs = null;
+									try { stitchMs = window.__sqaPerfStitchStart ? (Date.now() - window.__sqaPerfStitchStart) : null; } catch (e) {}
+									chrome.runtime.sendMessage({ action: 'processFinalImageBlob', imageBlob: reader.result, browserName: _lastBrowserInfo.browserName, browserVersion: _lastBrowserInfo.fullVersion, os: _lastOS, stitchMs: stitchMs, convMs: Date.now() - frT02, convBytes: frBytes2, convOut: (reader.result && reader.result.length) || 0 });
+								};
+								reader.readAsDataURL(blob);
+							}, 'stitch');
 						}
 						capturex_snap_mergedImage_array[k] = null;
 					}
@@ -2596,38 +2874,69 @@
 				tip.textContent = msg;
 				tip.style.opacity = '1';
 				clearTimeout(tip._hideTimer);
-				tip._hideTimer = setTimeout(() => { tip.style.opacity = '0'; }, 2500);
+				tip._hideTimer =					// PERF-09: ventana del transform 80 → 40 ms (el observer de crecimiento
+					// y los reflows del sitio son la señal real, no el sleep fijo).
+					setTimeout(() => {
+						try { console.log('[FEATURE_RUNTIME]', 'ScrollTransformWait ms=40'); } catch (e) {} tip.style.opacity = '0'; }, 2500);
 			},
 			// ── END PROGRESS OVERLAY ───────────────────────────────────
 
-			findScrollableElements: function () {
-				// SQA Scroll Finder: BFS-based detection with viewport-aware filtering
-				const SF = window.__sqaScrollFinder;
-				if (SF) {
-					const fullW = Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement.scrollWidth);
-					const fullH = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight);
-					const result = SF.find(window.innerWidth, window.innerHeight, fullW, fullH);
-					if (result && result.type === 'elt' && result.elt) return [result.elt];
-					if (result && result.type === 'frame' && result.frame) return [result.frame];
+		findScrollableElements: function () {
+			// PERF-06b: recorrido UNICO compartido. El walk barato (preScanDocument,
+			// sin getComputedStyle, cacheado) corre primero; el ScrollFinder evalua
+			// SOLO esos candidatos (findFromCandidates: estilos por candidato, sin
+			// BFS completo ni querySelectorAll). Sin SF, el mismo scan alimenta el
+			// loop legacy. Un solo walk por captura en todos los casos.
+			const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+			const scan = this.preScanDocument();
+			const raw = scan.scrollableRaw;
+			const SF = window.__sqaScrollFinder;
+			if (SF && typeof SF.findFromCandidates === 'function') {
+				let res = null;
+				try { res = SF.findFromCandidates(raw, scan.frames, window.innerWidth, window.innerHeight); } catch (e) { res = null; }
+				const ms = Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0);
+				if (res && res.type === 'elt' && res.elt) {
+					try { console.log('[FEATURE_RUNTIME]', 'ScrollDetect detector=finder prefiltered=' + raw.length + ' nodes=' + scan.nodes + ' ms=' + ms); } catch (e) {}
+					return [res.elt];
 				}
-				// Fallback: original querySelectorAll approach
-				const allElements = document.body ? document.body.querySelectorAll('*') : [];
-				const scrollableElements = [];
-				for (let i = 0; i < allElements.length; i++) {
-					const element = allElements[i];
-					if (capturex_com_tools.isVerticallyScrollable(element)) {
-						const rect = element.getBoundingClientRect();
-						const scrollHeight = element.scrollHeight;
-						if (rect.height > 30 && rect.width > 30 && scrollHeight > rect.height * 1.1) {
-							if (!capturex_com_tools.isElementOccluded(element))
-							scrollableElements.push(element);
-						}
-					} else if (capturex_com_tools.isVerticallyScrollableFrame(element)) {
-						scrollableElements.push(element);
-					}
+				if (res && res.type === 'frame' && res.frame) {
+					try { console.log('[FEATURE_RUNTIME]', 'ScrollDetect detector=finder prefiltered=' + raw.length + ' nodes=' + scan.nodes + ' ms=' + ms); } catch (e) {}
+					return [res.frame];
 				}
-				return scrollableElements;
+				// Sin ganador SF: el loop legacy abajo reutiliza el MISMO scan (sin
+				// walk extra). Se registra igual para trazabilidad de la ruta real.
+				try { console.log('[FEATURE_RUNTIME]', 'ScrollDetect detector=finder prefiltered=' + raw.length + ' nodes=' + scan.nodes + ' ms=' + ms + ' fallthrough=legacy'); } catch (e) {}
 			}
+			else if (SF) {
+				// Módulo SF desactualizado (sin findFromCandidates): ruta histórica.
+				const fullW = Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement.scrollWidth);
+				const fullH = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement.scrollHeight);
+				const result = SF.find(window.innerWidth, window.innerHeight, fullW, fullH);
+				const ms = Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t0);
+				try { console.log('[FEATURE_RUNTIME]', 'ScrollDetect detector=finder prefiltered=0 nodes=' + scan.nodes + ' ms=' + ms + ' mode=legacy-sf-walk'); } catch (e) {}
+				if (result && result.type === 'elt' && result.elt) return [result.elt];
+				if (result && result.type === 'frame' && result.frame) return [result.frame];
+			}
+			// PERF-05: fallback sobre candidatos del walk único (pre-filtro de overflow
+			// ya aplicado) — ya no querySelectorAll('*') con getComputedStyle por nodo.
+			const t1 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+			const scrollableElements = [];
+			for (let i = 0; i < raw.length; i++) {
+				const element = raw[i];
+				if (capturex_com_tools.isVerticallyScrollable(element)) {
+					const rect = _getCachedRect(element);
+					const scrollHeight = element.scrollHeight;
+					if (rect.height > 30 && rect.width > 30 && scrollHeight > rect.height * 1.1) {
+						if (!capturex_com_tools.isElementOccluded(element))
+							scrollableElements.push(element);
+					}
+				} else if (capturex_com_tools.isVerticallyScrollableFrame(element)) {
+					scrollableElements.push(element);
+				}
+			}
+			try { console.log('[FEATURE_RUNTIME]', 'ScrollDetect detector=legacy prefiltered=' + raw.length + ' nodes=' + scan.nodes + ' ms=' + Math.round(((typeof performance !== 'undefined') ? performance.now() : Date.now()) - t1)); } catch (e) {}
+			return scrollableElements;
+		}
 		};
 
 		capturex_com_saveAction.contentjsIsLoad();
@@ -2662,7 +2971,9 @@
 				sendResponse({ started: true });
 			}
 			else if (request.action === 'renderPdfInPage') {
-				renderPdfInPage(request.data, request.workerText);
+				// FUNC-07: el SW envía workerBlob (Blob), no workerText — la propiedad
+				// que se leía aquí nunca existía y el fallback de worker moría.
+				renderPdfInPage(request.data, request.workerBlob);
 				sendResponse({ started: true });
 			}
 			else if (request.action === 'croppedImageResult') {
@@ -2671,10 +2982,28 @@
 			}
 			else if (request.action === 'getNowShotImgData') {
 				sendResponse({ started: true });
-				chrome.runtime.sendMessage({ action: "requestCaptureScreenshot", y1: request.y1, y2: request.y2 }, function (response) {
-					if (response && response.imageData) {
-						if (capturex_contentEle) {
-							let pageType = 0;
+				// PERF-04: el SW adjunta el screenshot como Blob en el propio mensaje
+				// (structured_clone, manifest.json) y desaparece el round-trip legacy
+				// requestCaptureScreenshot con 2-8 MB de dataURL por viewport.
+				const processShot = function (shotSrc, y1, y2) {
+					// PERF-04b: ruta Blob-only. La rama legacy-dataurl y el pull
+					// requestCaptureScreenshot (2-8 MB por viewport) están eliminados:
+					// sin Blob no hay imagen que coser y se reporta fallo visible
+					// (captureWarning) en vez de un stall silencioso o un pull.
+					if (!shotSrc || !(shotSrc instanceof Blob)) {
+						try { console.log('[FEATURE_RUNTIME]', 'PageShotSource route=missing-blob blobPages=' + _pageShotBlobPages + ' dataUrlPages=' + _pageShotDataUrlPages); } catch (e) {}
+						try { console.error('[SQA] getNowShotImgData sin shotBlob: viewport no capturado (PERF-04b, sin pull legacy).'); } catch (e) {}
+						try { chrome.runtime.sendMessage({ action: 'captureWarning' }); } catch (e) {}
+						return;
+					}
+					let shotUrl = shotSrc;
+					// Cero conversión: el Image dibuja directo desde el objectURL.
+					shotUrl = URL.createObjectURL(shotSrc);
+					setTimeout(function () { try { URL.revokeObjectURL(shotUrl); } catch (e) {} }, 30000);
+					_pageShotBlobPages++;
+					try { console.log('[FEATURE_RUNTIME]', 'PageShotSource route=inline-blob blobPages=' + _pageShotBlobPages + ' dataUrlPages=' + _pageShotDataUrlPages); } catch (e) {}
+					if (capturex_contentEle) {
+						let pageType = 0;
 							if (request.y1 == 0 && request.y2 == 0 && capturex_capture_array.length == 0)
 								pageType = 0;
 							else if (request.y1 == 0 && request.y2 == 0 && capturex_capture_array.length > 0)
@@ -2682,7 +3011,7 @@
 							else if (request.y1 > 0 || request.y2 > 0)
 								pageType = 2;
 
-							capturex_com_saveAction.cropImageContent(response.imageData, pageType)
+							capturex_com_saveAction.cropImageContent(shotUrl, pageType)
 								.then(croppedImageUrl => {
 									capturex_capture_array.push(croppedImageUrl);
 									if (request.nextPageData) {
@@ -2698,7 +3027,7 @@
 											if (firstItem instanceof Blob) URL.revokeObjectURL(objectUrlFirst);
 											let imageWidth = img_first.width;
 											let imageHeight = img_first.height;
-											capturex_com_saveAction.splicingImagesAndSendAction(imageWidth, imageHeight, response.y1, response.y2);
+											capturex_com_saveAction.splicingImagesAndSendAction(imageWidth, imageHeight, y1, y2);
 										};
 										img_first.src = objectUrlFirst;
 									}
@@ -2708,9 +3037,11 @@
 									chrome.runtime.sendMessage({ action: "captureError", message: "Error al recortar la imagen: " + error.message });
 								});
 						}
-						else {
-							capturex_capture_array.push(response.imageData);
-							if (request.nextPageData) {
+					else {
+						// El array admite Blob (cropImageContent resuelve con Blob); push del
+						// Blob evita que el objectURL caduque antes del stitching.
+						capturex_capture_array.push(shotSrc instanceof Blob ? shotSrc : shotUrl);
+						if (request.nextPageData) {
 								capturex_com_saveAction.captureVisiblePageScreenshot(request.nextPageData.docHeight, request.nextPageData.nextScrollTop, request.nextPageData.windowInnerHeight, request.nextPageData.y1, request.nextPageData.y2);
 							}
 							else {
@@ -2724,13 +3055,15 @@
 									let imageWidth = img_first.width;
 									let imageHeight = img_first.height;
 
-									capturex_com_saveAction.splicingImagesAndSendAction(imageWidth, imageHeight, response.y1, response.y2);
+									capturex_com_saveAction.splicingImagesAndSendAction(imageWidth, imageHeight, y1, y2);
 								};
 								img_first.src = objectUrlFirst;
 							}
-						}
 					}
-				});
+				};
+				// PERF-04b: el SW siempre adjunta shotBlob inline (BinaryChannel). Sin
+				// pull legacy: processShot reporta el faltante como fallo visible.
+				processShot(request.shotBlob, request.y1, request.y2);
 				return true;
 			}
 		});
