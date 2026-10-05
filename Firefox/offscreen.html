@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Evidencias SQA — Offscreen Multipropósito (Keepalive + PDF)</title>
+</head>
+<body>
+  <!-- Keepalive para evitar cold-start del SW -->
+  <script src="offscreen.js"></script>
+  <!-- Render PDF full-page vía pdf.js — comparte el único Offscreen Document permitido por MV3 -->
+  <script type="module" src="pdf-render.js"></script>
+</body>
+</html>
