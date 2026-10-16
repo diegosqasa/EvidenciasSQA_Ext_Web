@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Política de Privacidad - Evidencias SQA</title>
+<meta name="description" content="Política de Privacidad oficial de la extensión Evidencias SQA">
+<style>
+:root{
+    --navy:#003060;
+    --orange:#FF6B00;
+    --bg:#F3F4F6;
+}
+*{box-sizing:border-box}
+body{
+    margin:0;
+    font-family:'Segoe UI',system-ui,sans-serif;
+    color:#1f2937;
+    background:var(--bg);
+    line-height:1.6;
+}
+header{
+    background:var(--navy);
+    color:#fff;
+    padding:24px;
+    border-bottom:4px solid var(--orange);
+    display:flex;
+    align-items:center;
+    gap:12px;
+}
+header img{height:36px}
+header h1{
+    margin:0;
+    font-size:22px;
+}
+main{
+    max-width:900px;
+    margin:32px auto;
+    background:#fff;
+    padding:32px;
+    border-radius:12px;
+    box-shadow:0 4px 20px rgba(0,0,0,.08);
+}
+h2{
+    color:var(--navy);
+    border-left:4px solid var(--orange);
+    padding-left:12px;
+    margin-top:32px;
+}
+.badge{
+    display:inline-block;
+    background:var(--navy);
+    color:#fff;
+    padding:2px 10px;
+    border-radius:20px;
+    font-size:12px;
+    font-weight:700;
+}
+table{
+    width:100%;
+    border-collapse:collapse;
+    margin:12px 0;
+}
+th,td{
+    border:1px solid #e5e7eb;
+    padding:8px 12px;
+    text-align:left;
+    font-size:14px;
+}
+th{
+    background:var(--navy);
+    color:#fff;
+}
+code{
+    background:#f1f5f9;
+    padding:2px 6px;
+    border-radius:4px;
+    font-size:13px;
+}
+footer{
+    text-align:center;
+    color:#64748b;
+    font-size:13px;
+    padding:24px;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    Media/SQA-128.png
+    <div>
+        <h1>Política de Privacidad - Evidencias SQA</h1>
+        <div style="opacity:.9;font-size:13px">
+            Extensión Web Evidencias SQA • Última actualización: 05 de septiembre de 2026
+        </div>
+    </div>
+</header>
+
+<main>
+
+<p>
+<span class="badge">SIN ANALYTICS • SIN PUBLICIDAD • SIN TERCEROS</span>
+Toda la información procesada por Evidencias SQA permanece en el dispositivo del usuario y únicamente se comunica con la aplicación local Evidencias SQA mediante <code>127.0.0.1</code>.
+</p>
+
+<h2>1. Finalidad de la extensión</h2>
+
+<p>
+Evidencias SQA es una herramienta diseñada para capturar, organizar y gestionar evidencias de pruebas de software.
+</p>
+
+<p>
+Permite a los analistas de calidad (QA) capturar contenido visual, agregar anotaciones esenciales y asociar cada evidencia a Historias de Usuario (HU) y Casos de Prueba (CP), facilitando la documentación, trazabilidad y generación de reportes de aseguramiento de calidad.
+</p>
+
+<p>
+La extensión funciona únicamente cuando el usuario inicia una captura de manera explícita.
+</p>
+
+<h2>2. Datos que se capturan</h2>
+
+<table>
+<tr>
+<th>Dato</th>
+<th>Uso</th>
+</tr>
+<tr>
+<td>Imagen capturada (PNG)</td>
+<td>Generar evidencia visual solicitada por el usuario</td>
+</tr>
+<tr>
+<td>URL de la página</td>
+<td>Metadatos de la evidencia</td>
+</tr>
+<tr>
+<td>Título de la página</td>
+<td>Metadatos de la evidencia</td>
+</tr>
+<tr>
+<td>Fecha y hora de captura</td>
+<td>Trazabilidad QA</td>
+</tr>
+<tr>
+<td>Navegador y versión</td>
+<td>Metadatos de la evidencia</td>
+</tr>
+<tr>
+<td>Sistema operativo</td>
+<td>Metadatos de la evidencia</td>
+</tr>
+</table>
+
+<p>
+La extensión <strong>no recopila</strong>:
+</p>
+
+<ul>
+<li>Historial de navegación</li>
+<li>Contraseñas</li>
+<li>Cookies</li>
+<li>Información financiera</li>
+<li>Información médica</li>
+<li>Pulsaciones de teclado</li>
+<li>Analítica de uso</li>
+<li>Telemetría de terceros</li>
+<li>Publicidad o seguimiento de usuarios</li>
+</ul>
+
+<h2>3. Dónde se almacenan los datos</h2>
+
+<table>
+<tr>
+<th>Almacén</th>
+<th>Contenido</th>
+<th>Retención</th>
+</tr>
+<tr>
+<td>chrome.storage.local</td>
+<td>Token temporal de autenticación y configuración básica</td>
+<td>Temporal</td>
+</tr>
+<tr>
+<td>IndexedDB (SQAOfflineDB)</td>
+<td>Capturas pendientes cuando la aplicación de escritorio no está disponible</td>
+<td>Hasta sincronización exitosa</td>
+</tr>
+<tr>
+<td>Memoria temporal del Service Worker</td>
+<td>Datos utilizados durante una captura activa</td>
+<td>Temporal</td>
+</tr>
+</table>
+
+<p>
+Las capturas no se almacenan en servidores externos.
+</p>
+
+<h2>4. Comunicación con la aplicación de escritorio</h2>
+
+<p>
+La extensión se comunica únicamente con la aplicación Evidencias SQA instalada en el mismo equipo mediante:
+</p>
+
+<pre><code>http://127.0.0.1:3000</code></pre>
+
+<p>
+La comunicación se utiliza exclusivamente para:
+</p>
+
+<ul>
+<li>Transferir capturas realizadas por el usuario.</li>
+<li>Sincronizar capturas pendientes.</li>
+<li>Consultar el estado de la aplicación local.</li>
+<li>Obtener tokens temporales de autenticación.</li>
+</ul>
+
+<p>
+No se utilizan cookies ni se envían datos a servicios externos.
+</p>
+
+<h2>5. Permisos utilizados</h2>
+
+<table>
+<tr>
+<th>Permiso</th>
+<th>Uso</th>
+</tr>
+<tr>
+<td>activeTab</td>
+<td>Capturar el contenido visible de la pestaña activa cuando el usuario inicia una captura.</td>
+</tr>
+
+<tr>
+<td>tabs</td>
+<td>Obtener URL, título y metadatos de la pestaña capturada.</td>
+</tr>
+
+<tr>
+<td>scripting</td>
+<td>Ejecutar temporalmente la lógica necesaria para capturas de página completa y selección de área.</td>
+</tr>
+
+<tr>
+<td>clipboardWrite</td>
+<td>Copiar capturas al portapapeles únicamente bajo acción explícita del usuario.</td>
+</tr>
+
+<tr>
+<td>storage</td>
+<td>Guardar configuraciones y tokens temporales necesarios para el funcionamiento de la extensión.</td>
+</tr>
+
+<tr>
+<td>unlimitedStorage</td>
+<td>Permitir almacenamiento temporal de capturas pendientes para sincronización offline.</td>
+</tr>
+
+<tr>
+<td>&lt;all_urls&gt;</td>
+<td>Permitir capturas en cualquier sitio web, intranet, ambiente de pruebas, localhost o documento PDF solicitado explícitamente por el usuario.</td>
+</tr>
+</table>
+
+<h2>6. Captura de documentos PDF y archivos locales</h2>
+
+<p>
+La extensión puede capturar documentos PDF abiertos por el usuario.
+</p>
+
+<p>
+Cuando el usuario habilita expresamente el acceso a URLs de archivo (<code>file://</code>) desde el navegador, la extensión puede procesar dichos documentos para generar la evidencia solicitada.
+</p>
+
+<p>
+No existe acceso automático a archivos locales fuera de una acción explícita iniciada por el usuario.
+</p>
+
+<h2>7. Uso de los datos</h2>
+
+<p>
+Los datos procesados por la extensión se utilizan exclusivamente para:
+</p>
+
+<ul>
+<li>Generar evidencias visuales.</li>
+<li>Asociar evidencias a Historias de Usuario y Casos de Prueba.</li>
+<li>Facilitar la documentación de pruebas.</li>
+<li>Generar reportes de QA.</li>
+<li>Sincronizar capturas con la aplicación Evidencias SQA.</li>
+</ul>
+
+<p>
+Los datos no se utilizan para publicidad, marketing, analítica o perfilado de usuarios.
+</p>
+
+<h2>8. Compartición de datos</h2>
+
+<p>
+Evidencias SQA no vende, comparte ni transfiere datos de usuarios a terceros.
+</p>
+
+<p>
+Toda la información permanece:
+</p>
+
+<ul>
+<li>En el dispositivo del usuario.</li>
+<li>En la extensión.</li>
+<li>En la aplicación local Evidencias SQA.</li>
+</ul>
+
+<h2>9. Seguridad</h2>
+
+<p>
+La comunicación entre la extensión y la aplicación Evidencias SQA se realiza exclusivamente mediante localhost:
+</p>
+
+<pre><code>127.0.0.1</code></pre>
+
+<p>
+Los tokens utilizados para la comunicación son temporales y se renuevan automáticamente.
+</p>
+
+<p>
+La extensión no acepta conexiones desde sitios externos ni carga código remoto.
+</p>
+
+<h2>10. Eliminación de datos</h2>
+
+<p>
+Al desinstalar la extensión:
+</p>
+
+<ul>
+<li>Se eliminan los datos almacenados en chrome.storage.local.</li>
+<li>Se elimina la base de datos IndexedDB asociada a la extensión.</li>
+</ul>
+
+<p>
+Las evidencias ya almacenadas en la aplicación de escritorio son gestionadas conforme a la política de dicha aplicación.
+</p>
+
+<h2>11. Contacto</h2>
+
+<p>
+Si tienes preguntas relacionadas con privacidad o tratamiento de datos:
+</p>
+
+<p>
+<strong>Evidencias SQA</strong><br>
+Correo: diego.machado@sqasa.co
+</p>
+
+<h2>Privacy Disclosure</h2>
+
+<p>
+Evidencias SQA no recopila datos para publicidad, analítica ni seguimiento de usuarios.
+</p>
+
+<p>
+Las capturas se generan únicamente bajo acción explícita del usuario y permanecen almacenadas localmente en el dispositivo.
+</p>
+
+<p>
+La extensión se comunica exclusivamente con la aplicación Evidencias SQA ejecutándose localmente mediante <code>127.0.0.1</code>.
+</p>
+
+<p>
+No se comparten ni venden datos de usuarios a terceros.
+</p>
+
+<h2>Single Purpose</h2>
+
+<p>
+Evidencias SQA ayuda a equipos de aseguramiento de calidad (QA) a capturar, organizar y documentar evidencias visuales de pruebas, vinculándolas a Historias de Usuario y Casos de Prueba para generar reportes estandarizados y mejorar la trazabilidad de las validaciones realizadas.
+</p>
+
+</main>
+
+<footer>
+© 2026 Evidencias SQA
+</footer>
+
+</body>
+</html>
