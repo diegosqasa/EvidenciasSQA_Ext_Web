@@ -221,13 +221,20 @@ async function captureVisibleFastPath(tab) {
 
 export async function executeCapture(tab, actionName) {
     const tabUrl = tab.url || '';
+    // FIX_PDF_VIEWER_GUARD: el visor PDF de Chrome vive en
+    // chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/... — el guard anterior
+    // bloqueaba TODA URL chrome-extension:// antes del routing PDF, así que un PDF
+    // cuya tab.url ya es la del visor moría con "Captura no permitida" sin traza.
+    // Se exime solo ese visor y solo para captura total (ruta PDF).
+    const isPdfViewerTab = tabUrl.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai');
+    const isPdfCapture = actionName === "captureAllPageScreenshot";
     if (
         !tabUrl ||
         tabUrl.startsWith("chrome://") ||
         tabUrl.startsWith("chrome-error://") ||
         tabUrl.startsWith("edge://") ||
         tabUrl.startsWith("about:") ||
-        tabUrl.startsWith("chrome-extension://") ||
+        (tabUrl.startsWith("chrome-extension://") && !(isPdfViewerTab && isPdfCapture)) ||
         tabUrl.includes("chrome.google.com/webstore") ||
         tabUrl.includes("chromewebstore.google.com")
     ) {
@@ -267,6 +274,7 @@ export async function executeCapture(tab, actionName) {
     const pdfReason = (actionName === "captureAllPageScreenshot") ? pdfRouteReason(tab) : null;
     if (actionName === "captureAllPageScreenshot") {
         pdfRouteLog('detect', Object.assign(pdfUrlInfo(tab), { match: pdfReason || 'none', route: pdfReason ? 'pdf-pipeline' : 'content-stitching' }));
+        try { console.log('[FEATURE_RUNTIME]', 'PdfDetected match=' + (pdfReason || 'none') + ' tabId=' + tab.id + ' url=' + String(tabUrl).slice(0, 120)); } catch (e) {}
     }
     if (pdfReason) {
         console.log('[capture-logic] PDF detectado, desviando a pdf.js offscreen', tab.url, tab.title);
@@ -286,18 +294,29 @@ export async function executeCapture(tab, actionName) {
         const isLoaded = await withTimeout(checkContentScript(tab.id), 3000, 'checkContentScript');
         if (!isLoaded) {
             try { console.log('[PERMISSION_TRACE] API=chrome.scripting.executeScript TabId=' + tab.id + ' Files=content.js Action=capture:fallback-inject'); } catch {}                const execT0 = performance.now();
-            await withTimeout(
-                    chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["js/sqa-scroll-finder.js", "js/sqa-styles.js", "content.js"] }),
-                5000,
-                'executeScript content.js'
-            );
+            // FIX_PDF_INJECT_TRACE: antes el fallo de executeScript se tragaba con
+            // .catch(()=>null) implícito en withTimeout y el tabs.sendMessage posterior
+            // moría con "Receiving end does not exist" sin decir que la inyección
+            // falló (caso visor PDF: frame chrome-extension:// no scripteable).
+            let injectErr = null;
+            try {
+                await withTimeout(
+                        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["js/sqa-scroll-finder.js", "js/sqa-styles.js", "content.js"] }),
+                    5000,
+                    'executeScript content.js'
+                );
+            } catch (e) { injectErr = e; }
+            try { console.log('[FEATURE_RUNTIME]', 'PdfInject attempt=content tabId=' + tab.id + ' ok=' + (!injectErr) + (injectErr ? ' err=' + String((injectErr && injectErr.message) || injectErr).slice(0, 160) : '')); } catch (e) {}
+            if (injectErr) throw injectErr;
             // AUDIT_EXTWEB_REAL_PERF_001: tiempo real de inyección.
             try { console.log('[PERF]', JSON.stringify({ t: Date.now(), tabId: tab.id, op: 'executeScript', ms: Math.round(performance.now() - execT0) })); } catch (e) {}
             await new Promise(r => setTimeout(r, 150));
         }
         try { console.log('[FEATURE_RUNTIME]', 'ContentInjectDone injected=' + (!isLoaded) + ' ms=150'); } catch (e) {}
 
+        try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=' + actionName + ' tabId=' + tab.id); } catch (e) {}
         const sent = await retrySendMessage(tab.id, { action: actionName });
+        try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=' + actionName + ' tabId=' + tab.id + ' ack=' + (!!sent)); } catch (e) {}
         if (!sent) {
             captureInProgress.delete(tab.id);
             markCaptureError("No se pudo iniciar la captura.", tab.id);

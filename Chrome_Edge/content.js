@@ -96,6 +96,11 @@
 
 	if (!window.hasInjectedContentScript || contextInvalidated) {
 		window.hasInjectedContentScript = true;
+		try { console.log('[FEATURE_RUNTIME]', 'ContentScriptLoaded href=' + String(location.href).slice(0, 120) + ' ct=' + (document.contentType || '')); } catch (e) {}
+		try {
+			var _sqaIsPdfHere = /\.pdf($|[?#])/i.test(location.href) || (document.contentType === 'application/pdf') || (document.title && /\.pdf($|[?#])/i.test(document.title));
+			if (_sqaIsPdfHere) console.log('[FEATURE_RUNTIME]', 'PdfDetected href=' + String(location.href).slice(0, 120));
+		} catch (e) {}
 
 		function createUniversalCanvas(width, height) {
 			const isOffscreen = typeof OffscreenCanvas !== 'undefined';
@@ -304,6 +309,7 @@
 				const b64 = btoa(bin);
 				const SIZE = 1500000;
 				const total = Math.max(1, Math.ceil(b64.length / SIZE));
+				try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=pdfLocalPdfChunk total=' + total); } catch (e) {}
 				for (let i = 0; i < total; i++) {
 					try {
 						chrome.runtime.sendMessage({ action: 'pdfLocalPdfChunk', index: i, total: total, data: b64.slice(i * SIZE, (i + 1) * SIZE) });
@@ -421,6 +427,7 @@
 					// Chrome >= 148); fallback dataURL legacy (JSON-safe) si el probe o
 					// algún chunk fallan. convMs/convBytes conservan la métrica D2.
 					const metaDD = { renderMs: Date.now() - inpageT0 };
+					try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=processFinalImageBlob via=inpage bytes=' + blob.size); } catch (e) {}
 					sendFinalBlobBinary(blob, metaDD, function () {
 						var frT0dd = Date.now();
 						var frdd = new FileReader();
@@ -1048,6 +1055,7 @@
 
 		var capturex_com_saveAction = {
 			contentjsIsLoad: function () {
+				try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=contentjsIsLoad'); } catch (e) {}
 				chrome.runtime.sendMessage({ action: "contentjsIsLoad" });
 			},
 			setCanvasMaxHeight: function (width) {
@@ -2943,6 +2951,7 @@
 
 		//receive messages
 		chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
+			try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=' + ((request && request.action) || 'none')); } catch (e) {}
 			// P1-2: solo mensajes de la propia extensión.
 			if (sender && sender.id && sender.id !== chrome.runtime.id) {
 				try { console.warn('[SECURITY_TRACE] Mensaje descartado en content.js:', sender.id, request && request.action); } catch (e) {}

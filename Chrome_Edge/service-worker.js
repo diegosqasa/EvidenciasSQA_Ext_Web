@@ -944,6 +944,36 @@ async function sendTabMessage(tabId, message) {
     });
 }
 
+// FIX_PDF_RECEIVER_CHECK: verifica que el receptor exista ANTES de enviar.
+// Ping checkContentLoaded → inyecta content.js (logando el error real en vez de
+// tragarlo) → re-ping. Devuelve true solo si hay listener. Todos los envíos a
+// tabs PDF deben pasar por aquí para que "Receiving end does not exist" quede
+// diagnosticado como inyección fallida (visor PDF no scripteable) o listener ausente.
+async function sqaEnsureContentScript(tabId, why) {
+    const ping = () => new Promise((resolve) => {
+        try {
+            chrome.tabs.sendMessage(tabId, { action: 'checkContentLoaded' }, (res) => {
+                if (chrome.runtime.lastError || !res || !res.loaded) resolve(false);
+                else resolve(true);
+            });
+        } catch (e) { resolve(false); }
+    });
+    if (await ping()) {
+        try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=checkContentLoaded tabId=' + tabId + ' ack=true why=' + why); } catch (e) {}
+        return true;
+    }
+    let injectErr = null;
+    try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    } catch (e) { injectErr = e; }
+    try { console.log('[FEATURE_RUNTIME]', 'PdfInject attempt=content tabId=' + tabId + ' ok=' + (!injectErr) + ' why=' + why + (injectErr ? ' err=' + String((injectErr && injectErr.message) || injectErr).slice(0, 160) : '')); } catch (e) {}
+    if (injectErr) return false;
+    await new Promise(r => setTimeout(r, 200));
+    const ok = await ping();
+    try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=checkContentLoaded tabId=' + tabId + ' ack=' + ok + ' why=' + why + '-postinject'); } catch (e) {}
+    return ok;
+}
+
 
 // PERF_CAPTURE_FULL_D2_EVALUATION: heap JS en MB (null si no disponible).
 function heapMB() {
@@ -1079,17 +1109,21 @@ async function sendPdfVisibleFallback(tabId) {
         if (!tab) return;
         pdfRouteLog('fallback-visible-requested', pdfUrlInfo(tab));
         captureInProgress.add(tabId);
-        const isLoaded = await new Promise((resolve) => {
-            chrome.tabs.sendMessage(tabId, { action: 'checkContentLoaded' }, (res) => {
-                if (chrome.runtime.lastError || !res || !res.loaded) resolve(false);
-                else resolve(true);
-            });
-        });
-        if (!isLoaded) {
-            await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => null);
-            await new Promise(r => setTimeout(r, 150));
+        // FIX_PDF_RECEIVER_CHECK: no enviar a ciegas; si no hay receptor, el
+        // tabs.sendMessage muere con "Receiving end does not exist".
+        const ready = await sqaEnsureContentScript(tabId, 'pdf-visible-fallback');
+        if (!ready) {
+            try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=fallback-no-receiver tabId=' + tabId); } catch (e) {}
+            log({ stage: 'pdf-fallback', status: 'failed', error: 'content script no inyectable en esta tab' });
+            return;
         }
-        chrome.tabs.sendMessage(tabId, { action: 'captureVisibleOnly' }, () => {});
+        try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=captureVisibleOnly tabId=' + tabId); } catch (e) {}
+        chrome.tabs.sendMessage(tabId, { action: 'captureVisibleOnly' }, () => {
+            try {
+                if (chrome.runtime.lastError) console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=fallback-send tabId=' + tabId + ' err=' + chrome.runtime.lastError.message);
+                else console.log('[FEATURE_RUNTIME]', 'MessageReceived action=captureVisibleOnly tabId=' + tabId + ' ack=true');
+            } catch (e) {}
+        });
     } catch (e) {
         log({ stage: 'pdf-fallback', status: 'failed', error: e.message });
     }
@@ -1133,6 +1167,7 @@ async function ensurePdfRenderAlive() {
 }
 
 function failPdfRender(tabId, reason) {
+    try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=failPdfRender tabId=' + (tabId || 'null') + ' reason=' + String(reason || 'unspecified').slice(0, 160)); } catch (e) {}
     pdfRouteLog('fallback-visible', { tabId: tabId || null, reason: reason || 'unspecified' });
     try { finishPdfCaptureCleanup(tabId); } catch (e) {}
     if (tabId && pdfInPageTimerById.has(tabId)) {
@@ -1172,17 +1207,14 @@ async function renderInPageFallback(tabId, tab, dataB64) {
         }
         if (!b64) throw new Error('Sin datos PDF');
         if (b64.length > 40000000) throw new Error('PDF demasiado grande para render en página');
-        // lib UMD siempre (idempotente); content solo si falta (guard anti re-inyección).
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['lib/pdf.min.js'] }).catch(() => null);
-        const isLoaded = await new Promise((resolve) => {
-            chrome.tabs.sendMessage(tabId, { action: 'checkContentLoaded' }, (res) => {
-                if (chrome.runtime.lastError || !res || !res.loaded) resolve(false);
-                else resolve(true);
-            });
+        // lib UMD siempre (idempotente); content solo si hay receptor verificado.
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['lib/pdf.min.js'] }).catch((e) => {
+            try { console.log('[FEATURE_RUNTIME]', 'PdfInject attempt=pdf-lib tabId=' + tabId + ' ok=false err=' + String((e && e.message) || e).slice(0, 160)); } catch (_) {}
         });
-        if (!isLoaded) {
-            await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => null);
-            await new Promise(r => setTimeout(r, 300));
+        const ready = await sqaEnsureContentScript(tabId, 'pdf-inpage-render');
+        if (!ready) {
+            failPdfRender(tabId, 'Content script no inyectable en el visor PDF (receiving end does not exist).');
+            return;
         }
         updateCaptureStatus({ active: true, mode: 'pdf', progress: 12, phase: 'capturing', message: 'Renderizando PDF en página...', error: '', tabId });
         touchHeartbeat();
@@ -1218,9 +1250,13 @@ async function renderInPageFallback(tabId, tab, dataB64) {
                 const t = pdfInPageTimerById.get(tabId);
                 if (t) clearTimeout(t);
                 pdfInPageTimerById.delete(tabId);
+                try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=inpage-send tabId=' + tabId + ' err=' + chrome.runtime.lastError.message); } catch (e) {}
                 failPdfRender(tabId, 'No se pudo iniciar render en página: ' + chrome.runtime.lastError.message);
+            } else {
+                try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=renderPdfInPage tabId=' + tabId + ' ack=true'); } catch (e) {}
             }
         });
+        try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=renderPdfInPage tabId=' + tabId + ' bytes=' + (b64 ? b64.length : 0)); } catch (e) {}
     } catch (e) {
         failPdfRender(tabId, (e && e.message) || 'renderInPageFallback');
     }
@@ -1255,6 +1291,7 @@ async function beginOffscreenPdfRender(tabId, tab, extra) {
     // Enviar con retry + log para diagnosticar offscreen singleton
     const sendPdfRender = (attempt = 1) => {
         try {
+            try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=renderPdf tabId=' + tabId + ' attempt=' + attempt); } catch (e) {}
             chrome.runtime.sendMessage(Object.assign({
                 action: 'renderPdf',
                 pdfUrl: tab.url,
@@ -1264,10 +1301,12 @@ async function beginOffscreenPdfRender(tabId, tab, extra) {
             }, extra || {}), (resp) => {
                     if (chrome.runtime.lastError) {
                         console.warn(`[pdf] sendMessage attempt ${attempt} failed: ${chrome.runtime.lastError.message}`);
+                        try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=offscreen-dispatch tabId=' + tabId + ' attempt=' + attempt + ' err=' + chrome.runtime.lastError.message); } catch (e) {}
                         if (attempt < 3) setTimeout(() => sendPdfRender(attempt + 1), 500);
                         else { renderInPageFallback(tabId, tab, (extra && extra.data) || null); }
                     } else {
                     console.log(`[pdf] renderPdf dispatched to offscreen (attempt ${attempt})`, resp);
+                    try { console.log('[FEATURE_RUNTIME]', 'MessageReceived action=renderPdf tabId=' + tabId + ' ack=true attempt=' + attempt); } catch (e) {}
                 }
             });
         } catch (e) {
@@ -1288,6 +1327,7 @@ async function startPdfCapture(tab) {
     if (!tabId || !tab.url) return;
     if (captureInProgress.has(tabId)) return;
     console.log('[pdf] startPdfCapture invoked', tabId, tab.url);
+    try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureStarted tabId=' + tabId + ' url=' + String(tab.url).slice(0, 120)); } catch (e) {}
     pdfRouteLog('start', Object.assign(pdfUrlInfo(tab), { contentType: tab.contentType || null }));
     // BUG_PDF_FILE_001: file:// no se puede leer desde offscreen/SW sin el toggle
     // "Permitir acceso a URLs de archivo". Con el toggle ON, el content script
@@ -1360,15 +1400,17 @@ async function startPdfCapture(tab) {
             // Intento 2: relay vía content script (inyectable con el toggle ON).
         }
         try {
-            const isLoaded = await new Promise((resolve) => {
-                chrome.tabs.sendMessage(tabId, { action: 'checkContentLoaded' }, (res) => {
-                    if (chrome.runtime.lastError || !res || !res.loaded) resolve(false);
-                    else resolve(true);
-                });
-            });
-            if (!isLoaded) {
-                await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => null);
-                await new Promise(r => setTimeout(r, 200));
+            // FIX_PDF_RECEIVER_CHECK: receptor verificado antes de pedir bytes.
+            const ready = await sqaEnsureContentScript(tabId, 'pdf-local-relay');
+            if (!ready) {
+                try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=local-no-receiver tabId=' + tabId); } catch (e) {}
+                log({ stage: 'pdf-local', status: 'failed', error: 'content script no inyectable (receiving end does not exist)' });
+                if (tabId) captureInProgress.delete(tabId);
+                finishCapturePerf(tabId);
+                markCaptureError('No se pudo leer el PDF local: content script no disponible.', tabId);
+                pdfPartialFallback.add(tabId);
+                sendPdfVisibleFallback(tabId);
+                return;
             }
             updateCaptureStatus({ active: true, mode: 'pdf', progress: 10, phase: 'capturing', message: 'Leyendo PDF local...', error: '', tabId });
             touchHeartbeat();
@@ -1389,8 +1431,10 @@ async function startPdfCapture(tab) {
             });
             mem04Enforce('pdflocal-create');
             markCapturePerf(tabId, 'local-bytes-requested');
+            try { console.log('[FEATURE_RUNTIME]', 'MessageSent action=readLocalPdfBytes tabId=' + tabId); } catch (e) {}
             chrome.tabs.sendMessage(tabId, { action: 'readLocalPdfBytes' }, () => {
                 if (chrome.runtime.lastError) {
+                    try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureFailed phase=local-send tabId=' + tabId + ' err=' + chrome.runtime.lastError.message); } catch (e) {}
                     const entry = pdfLocalBuffers.get(tabId);
                     if (entry) clearTimeout(entry.timer);
                     pdfLocalBuffers.delete(tabId);
@@ -1744,8 +1788,10 @@ async function _finalizeCapture(imageBlob, imageDataUrl, tab, browserName, brows
     // BUG_PDF_001: si el PDF degradó a vista visible, el estado final debe decirlo.
     if (tabId && pdfPartialFallback.has(tabId)) {
         pdfPartialFallback.delete(tabId);
+        try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureCompleted tabId=' + tabId + ' mode=partial-visible'); } catch (e) {}
         markCaptureCompleted('Captura parcial: solo la vista visible del PDF.');
     } else {
+        try { console.log('[FEATURE_RUNTIME]', 'PdfCaptureCompleted tabId=' + (tabId || 'null')); } catch (e) {}
         markCaptureCompleted();
     }
     imageBlob = null; imageDataUrl = null;
